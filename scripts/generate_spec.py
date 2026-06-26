@@ -757,8 +757,8 @@ def generate(root, design_width=375, focus=None):
         lines.append("| 图标名称 | 尺寸 | 颜色 | 切图文件 | 使用位置 |")
         lines.append("|---|---|---|---|---|")
         for icon in seen_icons.values():
-            svg_name = _guess_svg_name(icon["name"])
-            lines.append(f"| {icon['name']} | {icon['size']} | {icon['color']} | {svg_name} | {icon['location']} |")
+            asset_name = _guess_asset_name(icon["name"])
+            lines.append(f"| {icon['name']} | {icon['size']} | {icon['color']} | {asset_name} | {icon['location']} |")
 
     # 实现要点
     impl_notes = _generate_impl_notes(tree)
@@ -944,8 +944,8 @@ def _collect_all_icons(node, parent_name="", icons=None):
     return icons
 
 
-def _guess_svg_name(icon_name):
-    """根据图标名称推测对应的 SVG 文件名。"""
+def _guess_asset_name(icon_name):
+    """根据图标名称推测对应的切图文件名（SVG/PNG/JPG/WebP）。"""
     name_map = {
         "路径 2": "fanhui.svg",
         "Cap": "编组 7.svg",
@@ -961,7 +961,8 @@ def _guess_svg_name(icon_name):
         return "编组 7.svg"
     if "配套" in icon_name or "frame" in name_lower:
         return "Frame.svg"
-    return f"{icon_name}.svg"
+    # 默认返回原始名称，不限制扩展名
+    return f"{icon_name}.*"
 
 
 def _generate_impl_notes(tree):
