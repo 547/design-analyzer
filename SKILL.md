@@ -139,14 +139,27 @@ python3 scripts/generate_spec.py design.json --focus "配套 卡片"
 
 | 类型 | 说明 |
 |------|------|
-| Button | 按钮（有圆角 + 背景色 + 文字） |
-| Card | 卡片（有圆角 + 背景色） |
+| Button | 按钮（背景色 + 文字） |
+| Card | 卡片（背景色 + 内边距） |
 | List Item | 列表项 |
 | Input Field | 输入框 |
 | Navigation | 导航栏/Tab |
 | Modal | 弹窗/模态框 |
 | Form Row | 表单行（标签 + 值） |
 | Text Block | 文字块（多个文字组合） |
+| Heading | 标题（大字号 + 粗体） |
+| Description | 描述文字（小字号 + 浅色） |
+| Hint Text | 提示文字（小字号 + 浅色） |
+| Text | 普通文字 |
+| Label/Badge | 标签/徽章 |
+| Rounded Box | 圆角矩形 |
+| Rectangle | 矩形 |
+| Switch | 开关 |
+| Slider | 滑块 |
+| Progress Bar | 进度条 |
+| Checkbox | 复选框 |
+| Radio | 单选框 |
+| List Container | 列表容器 |
 | Icon | 图标（小尺寸 Vector/Bitmap） |
 | Avatar | 头像 |
 | Divider | 分隔线 |
