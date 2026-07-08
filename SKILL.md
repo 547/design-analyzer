@@ -1,6 +1,6 @@
 ---
 name: design-analyzer
-description: 从摹客图层 JSON 生成设计规格文档。当用户提供摹客导出的 JSON 文件并要求分析设计稿、生成开发任务清单或实现页面时触发。
+description: 从摹客(Mockplus)导出的设计稿 JSON 自动生成前端开发规格文档（色值、字号、间距、组件层级树、开发任务清单、切图对应表、实现要点）。当用户**拿到任何摹客 JSON 文件**、需要把设计稿转成实现文档、生成前端开发任务清单、或对照设计稿还原页面时，**立即**使用此 skill，即使对方没有显式提到"规格文档"或"分析"。
 ---
 
 # design-analyzer 使用指南
@@ -37,6 +37,10 @@ python3 scripts/generate_spec.py design.json --focus "商品卡片"
 python3 scripts/generate_spec.py design.json --focus "配套 卡片"
 ```
 
+**可选参数**：
+- `-o, --output <路径>`：自定义输出文件路径（默认输出到调用目录下的 `design-analyzer/spec_页面名.md`，目录不存在会自动创建）
+- `-w, --width <数字>`：设计图基准宽度（默认 375，用于 rpx 换算参考）
+
 ### 步骤 3：阅读生成的规格文档
 
 脚本输出 `spec_页面名.md`，按以下顺序阅读：
@@ -56,12 +60,12 @@ python3 scripts/generate_spec.py design.json --focus "配套 卡片"
 - 间距：使用文档中的精确值（单位根据项目决定）
 - 布局：按照文档中的布局方向（vertical ↓ / horizontal →）实现
 
-**注意实现要点中的提示**：
+**注意实现要点中的提示**（以下均按设计稿真实检测结果生成，以文档实际输出为准）：
 - 分隔线 vs 间距：Vector 分隔线（height ≤ 1px）是真实元素，1px 间距是布局间隙
-- 字段行：默认没有分隔线，除非文档中明确显示 Divider 子元素
-- Tab 导航：默认底部没有分隔线，除非文档中显示 border
-- 配套卡片：只有 header 有背景色，商品列表复用普通卡片样式
-- 白色区块：注意区分页面背景（#F2F2F2）和内容区块背景（#FFFFFF）
+- 字段行：是否带分隔线以文档「实现要点」中对应条目为准（脚本会逐行检测 Divider 子元素）
+- Tab 导航：底部是否有分隔线以文档「实现要点」为准（脚本会检测 Tab 栏底部 1px 分隔线）
+- 配套卡片：头部 header 与商品列表的背景色、圆角均以文档输出为准
+- 白色区块：注意区分页面背景（见文档顶部「**页面**」行的背景色）和内容区块背景（#FFFFFF）
 
 ---
 
@@ -95,7 +99,7 @@ python3 scripts/generate_spec.py design.json --focus "配套 卡片"
 | 标记 | 含义 | 示例 |
 |------|------|------|
 | `bg=#色值` | 背景色 | `bg=#FFFFFF` |
-| `r=[值]` | 圆角（4个值=四角，1个值=统一） | `r=[8,8,0,0]` 或 `r=[12]` |
+| `r=[值]` | 圆角（4个值=四角，1个值=统一，逗号+空格分隔） | `r=[8, 8, 0, 0]` 或 `r=[12]` |
 | `border=N` | 边框数量 | `border=1` |
 | `opacity=值` | 透明度 | `opacity=0.5` |
 | `blur=值` | 模糊半径 | `blur=10` |
@@ -115,7 +119,7 @@ python3 scripts/generate_spec.py design.json --focus "配套 卡片"
 | `fs=N` | 字号（font-size） |
 | `fw=N` | 字重（font-weight） |
 | `lh=N` | 行高（line-height） |
-| `align=值` | 对齐方式 |
+| `align=值` | 对齐方式（可选项，多数文字无对齐值时不输出） |
 | `#色值` | 文字颜色 |
 
 **图标标记**：
