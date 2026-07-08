@@ -6,7 +6,6 @@
 
 用法:
   python3 generate_spec.py design.json           # 全量分析
-  python3 generate_spec.py design.json --focus "配套 卡片"  # 部分修改（多关键词空格分隔）
 """
 
 import json, argparse, sys, os
@@ -531,64 +530,8 @@ def _comp_type_matches(kw, comp_type):
             return True
     return False
 
-def _node_has_match(node, focus_keywords):
-    if not focus_keywords:
-        return True
-    name = node.get("name", "").lower()
-    comp = node.get("component", "")
-    for kw in focus_keywords:
-        matched = False
-        if kw in name:
-            matched = True
-        elif _comp_type_matches(kw, comp):
-            matched = True
-        else:
-            for t in node.get("texts", []):
-                if kw in t.get("text", "").lower():
-                    matched = True
-                    break
-        if not matched:
-            for child in node.get("children", []):
-                if _node_has_match(child, [kw]):
-                    matched = True
-                    break
-        if not matched:
-            return False
-    return True
-
-def generate_development_tasks(tree, focus=None):
+def generate_development_tasks(tree):
     tasks = []
-    
-    def collect_texts_recursive(node):
-        all_texts = []
-        for t in node.get("texts", []):
-            all_texts.append(t.get("text", ""))
-        for child in node.get("children", []):
-            all_texts.extend(collect_texts_recursive(child))
-        return all_texts
-    
-    focus_keywords = [k.strip().lower() for k in focus.split()] if focus else []
-    
-    def is_focus_match(name, path, comp_type, node=None):
-        if not focus_keywords:
-            return True
-        name_lower = name.lower()
-        path_lower = path.lower()
-        all_texts = collect_texts_recursive(node) if node else []
-        for kw in focus_keywords:
-            matched = False
-            if kw in name_lower or kw in path_lower:
-                matched = True
-            elif _comp_type_matches(kw, comp_type):
-                matched = True
-            elif node:
-                for t in all_texts:
-                    if kw in t.lower():
-                        matched = True
-                        break
-            if not matched:
-                return False
-        return True
     
     def traverse(node, parent_path="", depth=0):
         comp_type = node.get("component", "")
@@ -601,28 +544,21 @@ def generate_development_tasks(tree, focus=None):
         path = f"{parent_path} > {nname}" if parent_path else nname
         
         if comp_type in ("Button", "Card", "List Item", "Input Field", "Navigation", "Modal", "Container", "Form Row"):
-            if is_focus_match(nname, path, comp_type, node):
-                has_matching_child = False
-                for child in node.get("children", []):
-                    if _node_has_match(child, focus_keywords):
-                        has_matching_child = True
-                        break
-                if not focus_keywords or not has_matching_child or comp_type != "Container":
-                    task = {
-                        "component": comp_type,
-                        "name": nname,
-                        "path": path,
-                        "size": f"{bounds['width']:.0f}×{bounds['height']:.0f}px",
-                        "style": [],
-                        "text_count": len(texts),
-                        "children_count": len(node.get("children", [])),
-                        "priority": "high" if depth <= 2 else "medium",
-                    }
-                    if fills:
-                        task["style"].append(f"background: {','.join(fills)}")
-                    if radius:
-                        task["style"].append(f"border-radius: {radius}")
-                    tasks.append(task)
+            task = {
+                "component": comp_type,
+                "name": nname,
+                "path": path,
+                "size": f"{bounds['width']:.0f}×{bounds['height']:.0f}px",
+                "style": [],
+                "text_count": len(texts),
+                "children_count": len(node.get("children", [])),
+                "priority": "high" if depth <= 2 else "medium",
+            }
+            if fills:
+                task["style"].append(f"background: {','.join(fills)}")
+            if radius:
+                task["style"].append(f"border-radius: {radius}")
+            tasks.append(task)
         
         for child in node.get("children", []):
             traverse(child, path, depth + 1)
@@ -633,7 +569,7 @@ def generate_development_tasks(tree, focus=None):
 
 # ---- 文档生成 ----
 
-def generate(root, design_width=375, focus=None):
+def generate(root, design_width=375):
     tree = build_tree(root)
     if not tree:
         tree = {"type": "FRAME", "name": "Root", "bounds": get_bounds(root),
@@ -656,10 +592,7 @@ def generate(root, design_width=375, focus=None):
         side_pad = round((bn["width"] - content_w) / 2)
         if side_pad > 0:
             lines.append(f"**内容区**: 宽 {content_w:.0f}px 居中，左右各 {side_pad}px padding（{content_w:.0f}×…px 容器）")
-    if focus:
-        lines.append(f"**聚焦**: `{focus}`\n")
-    else:
-        lines.append("")
+    lines.append("")
 
     # 可复用组件分析（提前计算，用于正文折叠重复实例）
     reusable = _analyze_reusable_components(tree)
@@ -758,12 +691,9 @@ def generate(root, design_width=375, focus=None):
             lines.append("")
 
     # 开发任务清单
-    tasks = generate_development_tasks(tree, focus=focus)
+    tasks = generate_development_tasks(tree)
     if tasks:
-        if focus:
-            lines.append(f"\n---\n## 📋 开发任务清单（聚焦: {focus}）")
-        else:
-            lines.append("\n---\n## 📋 开发任务清单")
+        lines.append("\n---\n## 📋 开发任务清单")
         lines.append("| 优先级 | 组件类型 | 名称 | 尺寸 | 样式要点 |")
         lines.append("|---|---|---|---|---|")
         for task in sorted(tasks, key=lambda t: {"high": 0, "medium": 1, "low": 2}[t["priority"]]):
@@ -1289,7 +1219,6 @@ def main():
     p.add_argument("file", help="摹客 JSON 文件路径")
     p.add_argument("-o", "--output", help="输出文件路径（默认调用目录下的 design-analyzer/spec_页面名.md）")
     p.add_argument("-w", "--width", type=int, default=375, help="设计图宽度（默认 375px）")
-    p.add_argument("--focus", help="聚焦指定组件/区域（用于部分修改场景，匹配名称或路径）")
     args = p.parse_args()
 
     with open(args.file) as f:
@@ -1307,7 +1236,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         out_file = os.path.join(out_dir, f"spec_{page_name}.md")
 
-    md = generate(root, args.width, focus=args.focus)
+    md = generate(root, args.width)
 
     with open(out_file, "w") as f:
         f.write(md)

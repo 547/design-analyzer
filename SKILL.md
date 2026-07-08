@@ -27,16 +27,6 @@ description: 从摹客(Mockplus)导出的设计稿 JSON 自动生成前端开发
 python3 scripts/generate_spec.py design.json
 ```
 
-**部分修改**（已有页面，只改某部分）：
-```bash
-python3 scripts/generate_spec.py design.json --focus "商品卡片"
-```
-
-多关键词用空格分隔（AND 逻辑）：
-```bash
-python3 scripts/generate_spec.py design.json --focus "配套 卡片"
-```
-
 **可选参数**：
 - `-o, --output <路径>`：自定义输出文件路径（默认输出到调用目录下的 `design-analyzer/spec_页面名.md`，目录不存在会自动创建）
 - `-w, --width <数字>`：设计图基准宽度（默认 375，用于 rpx 换算参考）
