@@ -420,7 +420,7 @@ def build_tree(node, depth=0):
                     tcolors.append(t["color"])
         return {
             "type": ntype, "name": nname, "bounds": bn,
-            "fills": fills or tcolors, "radius": radius, "borders": borders,
+            "fills": fills, "radius": radius, "borders": borders,
             "dash": get_dash(node),
             "opacity": opacity, "blur": blur,
             "texts": texts, "children": [], "component": comp_type,
