@@ -791,10 +791,12 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
                 a_name = sorted_children[i].get("name", "")
                 b_name = sorted_children[i + 1].get("name", "")
                 gaps.append((a_name, b_name, g))
-        if gaps:
-            lines.append(f"{anno_prefix}- 子元素间距:")
+        if gaps and depth > 0:
+            # 根节点（页面级）间距对实现无意义，且会打断树形连续性，跳过
+            # 间距列表与子节点树同级缩进（用 child_prefix），保持树形视觉连续
+            lines.append(f"{child_prefix}- 子元素间距:")
             for a, bn, g in gaps[:10]:
-                lines.append(f"{anno_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
+                lines.append(f"{child_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
 
     for idx, child in enumerate(sorted_children):
         child_path = f"{path} > {child.get('name', '')}" if path else child.get("name", "")
