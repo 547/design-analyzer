@@ -571,6 +571,7 @@ def generate_development_tasks(tree):
 
 def generate(root, design_width=375):
     tree = build_tree(root)
+    tree["_root_height"] = get_bounds(root).get("height", 0)
     if not tree:
         tree = {"type": "FRAME", "name": "Root", "bounds": get_bounds(root),
                 "fills": get_fill_colors(root), "texts": [], "children": [], "component": "Container"}
@@ -745,6 +746,80 @@ def generate(root, design_width=375):
     return "\n".join(lines)
 
 
+def _infer_semantic(node):
+    """从节点自身与子树结构推断业务语义标签（纯 JSON 驱动，不写死业务名）。
+
+    只在高置信度命中结构模式时返回标签；不确定返回 ""。对仅凭位置/形态推测、
+    但 JSON 无明确文字佐证的，用「推测：」前缀区分，避免伪造确定信息。
+    """
+    name = node.get("name", "")
+    comp = node.get("component", "")
+    ntype = node.get("type", "")
+    texts = [t.get("text", "") for t in node.get("texts", [])]
+    children = node.get("children", [])
+
+    def collect_texts(n):
+        out = [t.get("text", "") for t in n.get("texts", [])]
+        for c in n.get("children", []):
+            out.extend(collect_texts(c))
+        return out
+
+    all_txt = collect_texts(node)
+    all_lower = [t.lower() for t in all_txt]
+    name_lower = name.lower()
+
+    # 1. Switch 开关：自身或子树含 on/off 文本，或名称含 switch/开关
+    if "switch" in name_lower or "开关" in name:
+        return "Switch 开关"
+    if any(t in ("on", "off", "开启", "关闭") for t in all_lower):
+        # 仅当节点较小（开关形态）才标，避免误伤含 on/off 文字的区块
+        bn = node.get("bounds", {})
+        if 0 < bn.get("width", 0) <= 80 and 0 < bn.get("height", 0) <= 60:
+            return "Switch 开关"
+
+    # 2. 数量选择器：含 [-] 与 [+] 文本（或图标名），且附近有输入框
+    has_minus = any("-" in t or "minus" in t.lower() for t in all_lower)
+    has_plus = any("+" in t or "plus" in t.lower() for t in all_lower)
+    if has_minus and has_plus:
+        return "数量选择器"
+
+    # 3. 顶部/标题栏：位于页面顶部（top 较小）且含返回按钮 + 居中标题文本
+    bn = node.get("bounds", {})
+    if bn.get("top", 0) <= 100 and bn.get("width", 0) >= 300:
+        has_back = "fanhui" in name_lower or "返回" in name_lower or any("fanhui" in t.lower() for t in all_lower)
+        has_title_text = any(len(t) >= 2 and t not in ("on", "off") for t in all_txt)
+        if has_back and has_title_text:
+            return "顶部栏"
+
+    # 4. 底部操作栏：位于页面底部（top 接近页面高度）且含按钮形态子节点
+    root_h = node.get("_root_height", 0)
+    if root_h and bn.get("top", 0) > root_h - 120 and bn.get("width", 0) >= 300:
+        btn_like = any(c.get("component") in ("Button", "Navigation") or
+                       "按钮" in c.get("name", "") or "button" in c.get("name", "").lower()
+                       for c in children)
+        if btn_like:
+            return "推测：底部操作栏"
+
+    # 5. 卡片语义：白色/浅色背景 + 圆角 + 较大内容容器（高度>80 且含多个子结构）
+    #    取子树首个较长「标题文本」作为卡片业务名。小按钮/小标签不误判为卡片。
+    fills = node.get("fills", [])
+    radius = node.get("radius", [])
+    if (not fills or fills[0].upper() in ("#FFFFFF", "#F7F8FA", "#FAFAFA", "#F6F6F6")) and radius:
+        if bn.get("height", 0) > 80 and len(children) >= 2:
+            has_form = any(c.get("component") in ("Form Row", "Text Block", "Container", "Card")
+                           for c in children)
+            if has_form:
+                title_candidate = ""
+                for t in all_txt:
+                    if len(t) >= 2 and t not in ("on", "off") and not t.isdigit():
+                        title_candidate = t
+                        break
+                if title_candidate:
+                    return f"卡片（{title_candidate}）"
+
+    return ""
+
+
 def _render(node, lines, depth, path="", reusable_ref=None):
     h = ["##", "###", "####", "#####", "######"]
     level = h[min(depth, len(h) - 1)]
@@ -779,11 +854,15 @@ def _render(node, lines, depth, path="", reusable_ref=None):
     flag_str = f" ({'; '.join(flags)})" if flags else ""
     indent = "  " * depth if depth > 2 else ""
 
+    # 业务语义标注（纯 JSON 驱动，融合语义树优点，保留图层名可溯源）
+    semantic = _infer_semantic(node)
+    sem_str = f"  ⟶ {semantic}" if semantic else ""
+
     if depth <= 1:
-        lines.append(f"\n{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}")
+        lines.append(f"\n{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}{sem_str}")
     else:
         ntype = node.get("type", "")
-        lines.append(f"\n{indent}{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}")
+        lines.append(f"\n{indent}{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}{sem_str}")
 
     # 输出图标名称（如果有）
     icon_name = node.get("icon_name", "")
