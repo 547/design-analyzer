@@ -2,7 +2,8 @@
 """生成设计规格文档（Markdown）。
 
 从摹客图层 JSON 提取：色值、坐标、字号、圆角、间距
-自动推断：组件类型、布局方向、开发任务清单
+自动推断：组件类型、布局方向、业务语义、实现要点
+默认输出「页面结构（树形）+ 实现要点」两节，去除可从结构树推导的冗余统计
 
 用法:
   python3 generate_spec.py design.json           # 全量分析
@@ -603,131 +604,10 @@ def generate(root, design_width=375):
         for loc in group["locations"][1:]:
             reusable_ref[loc] = i
 
+    lines.append("\n---\n## 页面结构")
     _render(tree, lines, 0, path=tree.get("name", ""), reusable_ref=reusable_ref)
 
-    # 颜色表
-    cc = Counter()
-    _collect_colors(root, cc)
-    lines.append("\n---\n## 颜色表")
-    lines.append("| 色值 | 次数 | 推测用途 |")
-    lines.append("|---|---|---|")
-    usage = {
-        "#F2F2F2": "页面背景", "#FFFFFF": "卡片/行底色", "#FAFAFA": "页面背景",
-        "#F5F5F5": "次要背景", "#3975C6": "导航栏", "#2C2C2C": "页面标题",
-        "#3B4058": "正文/字段值", "#707589": "标签/次要文字", "#666666": "次要文字",
-        "#3183F5": "激活态Tab/状态标签", "#999999": "未激活Tab/占位文字",
-        "#409EFF": "按钮文字/蓝色条", "#F7F8FA": "商品组底色", "#FEF2EC": "配套头底色",
-        "#F25C0C": "配套图标/标签橙色", "#FF6600": "强调色/价格", "#FF5722": "强调色",
-        "#F58723": "状态标签/橙色文字",
-        "#FF4D4F": "错误/警告", "#52C41A": "成功/完成", "#000000": "底部指示器",
-        "#333333": "重要文字", "#1A1A1A": "标题文字",
-    }
-    
-    def guess_usage(color):
-        if color in usage:
-            return usage[color]
-        hex_str = color.lstrip('#')
-        r, g, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
-        brightness = (r * 299 + g * 587 + b * 114) / 1000
-        if brightness > 240:
-            return "浅色背景"
-        if brightness < 50:
-            return "深色文字/背景"
-        if r > 200 and g < 100 and b < 100:
-            return "红色系（错误/警告）"
-        if r < 100 and g > 150 and b < 100:
-            return "绿色系（成功）"
-        if r < 100 and g < 150 and b > 200:
-            return "蓝色系（主色/链接）"
-        if r > 200 and g > 150 and b < 100:
-            return "橙色系（强调/价格）"
-        return "—"
-    
-    for color, count in cc.most_common(20):
-        lines.append(f"| {color} | {count} | {guess_usage(color)} |")
-
-    # 字体样式表
-    fc = Counter()
-    collect_font_styles(root, fc)
-    if fc:
-        lines.append("\n---\n## 字体样式表")
-        lines.append("| 字号/字重/颜色 | 出现次数 |")
-        lines.append("|---|---|")
-        for style, count in fc.most_common(15):
-            lines.append(f"| {style} | {count} |")
-
-    # 间距模式
-    spacing_patterns = {"vertical": [], "horizontal": []}
-    collect_spacing_patterns(root, spacing_patterns)
-    if spacing_patterns["vertical"] or spacing_patterns["horizontal"]:
-        lines.append("\n---\n## 间距模式")
-        if spacing_patterns["vertical"]:
-            v_counter = Counter(spacing_patterns["vertical"])
-            lines.append("### 垂直间距")
-            for gap, count in v_counter.most_common(8):
-                lines.append(f"  - {gap}px: {count}次 ({px2rpx(gap)}rpx)")
-        if spacing_patterns["horizontal"]:
-            h_counter = Counter(spacing_patterns["horizontal"])
-            lines.append("\n### 水平间距")
-            for gap, count in h_counter.most_common(8):
-                lines.append(f"  - {gap}px: {count}次 ({px2rpx(gap)}rpx)")
-
-    # 可复用组件（reusable 已在 _render 前计算，供正文折叠使用）
-    if reusable:
-        lines.append("\n---\n## 可复用组件")
-        lines.append("以下组件在页面中多次出现，结构相同，建议提取为独立组件：\n")
-        for i, group in enumerate(reusable, 1):
-            lines.append(f"### {i}. {group['name']}（出现 {group['count']} 次）")
-            lines.append(f"- **类型**: {group['component']}")
-            lines.append(f"- **尺寸**: {group['size']}")
-            lines.append(f"- **背景色**: {group['bg']}")
-            if group.get("radius"):
-                lines.append(f"- **圆角**: {group['radius']}")
-            if group.get("border"):
-                lines.append(f"- **边框**: {group['border']}")
-            lines.append(f"- **子元素**: {group['children_desc']}")
-            lines.append(f"- **使用位置**: {', '.join(group['locations'][:5])}")
-            if group['count'] > 5:
-                lines.append(f"  - ... 等 {group['count']} 处")
-            lines.append("")
-
-    # 开发任务清单
-    tasks = generate_development_tasks(tree)
-    if tasks:
-        lines.append("\n---\n## 📋 开发任务清单")
-        lines.append("| 优先级 | 组件类型 | 名称 | 尺寸 | 样式要点 |")
-        lines.append("|---|---|---|---|---|")
-        for task in sorted(tasks, key=lambda t: {"high": 0, "medium": 1, "low": 2}[t["priority"]]):
-            style_str = ", ".join(task["style"]) if task["style"] else "—"
-            lines.append(f"| {task['priority'].upper()} | {task['component']} | {task['name']} | {task['size']} | {style_str} |")
-
-    # 文字清单
-    all_texts = _collect_all_texts(tree)
-    if all_texts:
-        lines.append("\n---\n## 文字清单")
-        seen = set()
-        for t in all_texts:
-            if t["text"] not in seen and t["text"]:
-                seen.add(t["text"])
-                lines.append(f"- `{t['text']}`")
-
-    # 切图对应表
-    icons = _collect_all_icons(tree)
-    if icons:
-        # 去重：按图标名称去重
-        seen_icons = {}
-        for icon in icons:
-            key = icon["name"]
-            if key not in seen_icons:
-                seen_icons[key] = icon
-        lines.append("\n---\n## 切图对应表")
-        lines.append("| 图标名称 | 尺寸 | 颜色 | 切图文件 | 使用位置 |")
-        lines.append("|---|---|---|---|---|")
-        for icon in seen_icons.values():
-            asset_name = _guess_asset_name(icon["name"])
-            lines.append(f"| {icon['name']} | {icon['size']} | {icon['color']} | {asset_name} | {icon['location']} |")
-
-    # 实现要点
+    # 实现要点（跨节点/行为级约束，页面结构树无法体现的全局提示，开发照稿实现必需）
     impl_notes = _generate_impl_notes(tree)
     if impl_notes:
         # 去重
@@ -820,9 +700,7 @@ def _infer_semantic(node):
     return ""
 
 
-def _render(node, lines, depth, path="", reusable_ref=None):
-    h = ["##", "###", "####", "#####", "######"]
-    level = h[min(depth, len(h) - 1)]
+def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last=True):
     name = node["name"]
     bn = node["bounds"]
     w, ht = bn.get("width", 0), bn.get("height", 0)
@@ -852,22 +730,29 @@ def _render(node, lines, depth, path="", reusable_ref=None):
         flags.append(f"{layout['type']} {layout.get('direction', '')}")
 
     flag_str = f" ({'; '.join(flags)})" if flags else ""
-    indent = "  " * depth if depth > 2 else ""
 
-    # 业务语义标注（纯 JSON 驱动，融合语义树优点，保留图层名可溯源）
+    # 业务语义标注（纯 JSON 驱动，保留图层名可溯源）
     semantic = _infer_semantic(node)
-    sem_str = f"  ⟶ {semantic}" if semantic else ""
+    sem_str = f"（语义：{semantic}）" if semantic else ""
 
-    if depth <= 1:
-        lines.append(f"\n{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}{sem_str}")
+    # 树形连接符：根节点无前缀；其余用 ├── / └──
+    if depth == 0:
+        connector = ""
     else:
-        ntype = node.get("type", "")
-        lines.append(f"\n{indent}{level} [{comp_type}] {name} — {w:.0f}×{ht:.0f}px{flag_str}{sem_str}")
+        connector = "└── " if is_last else "├── "
+
+    lines.append(f"{prefix}{connector}{name}{sem_str} {w:.0f}×{ht:.0f}px{flag_str}")
+
+    # 子节点/注解的缩进前缀：当前层级往下传 ┊/空格
+    child_prefix = prefix
+    if depth > 0:
+        child_prefix += "    " if is_last else "│   "
+    anno_prefix = child_prefix + "  "
 
     # 输出图标名称（如果有）
     icon_name = node.get("icon_name", "")
     if icon_name:
-        lines.append(f"{indent}  - [图标: {icon_name}]")
+        lines.append(f"{anno_prefix}- [图标: {icon_name}]")
 
     for t in node.get("texts", []):
         fs = f"fs={t['fontSize']}" if t.get("fontSize") else ""
@@ -877,14 +762,12 @@ def _render(node, lines, depth, path="", reusable_ref=None):
         alignment = t.get("alignment", "")
         align_str = f"align={alignment}" if alignment else ""
         extra = " ".join(filter(None, [fs, fw, lh, align_str]))
-        lines.append(f"{indent}  - `{t['text']}`  {extra}  {fc}")
+        lines.append(f"{anno_prefix}- `{t['text']}`  {extra}  {fc}")
 
     children = merge_repeats(node.get("children", []))
     # Sort based on layout direction: horizontal layouts sort by left, vertical by top
     layout = node.get("layout", {})
     if layout.get("type") == "horizontal":
-        # 文本块（子节点全是文字）按阅读顺序排序：先 top 后 left，
-        # 否则多行文字会被当成单行按 left 排序导致上下行颠倒。
         if children and all(c.get("type") == "TEXT" for c in children):
             sorted_children = sorted(
                 children,
@@ -893,10 +776,8 @@ def _render(node, lines, depth, path="", reusable_ref=None):
         else:
             sorted_children = sorted(children, key=lambda c: c.get("bounds", {}).get("left", 0))
     elif layout.get("type") == "grid":
-        # Grid: sort by row (top) then column (left)
         sorted_children = sorted(children, key=lambda c: (c.get("bounds", {}).get("top", 0), c.get("bounds", {}).get("left", 0)))
     else:
-        # Vertical or mixed: sort by top
         sorted_children = sorted(children, key=lambda c: c.get("bounds", {}).get("top", 0))
     if len(sorted_children) > 1:
         gaps = []
@@ -911,20 +792,18 @@ def _render(node, lines, depth, path="", reusable_ref=None):
                 b_name = sorted_children[i + 1].get("name", "")
                 gaps.append((a_name, b_name, g))
         if gaps:
-            gap_indent = "  " * max(depth, 2)
-            lines.append(f"{gap_indent}- 子元素间距:")
+            lines.append(f"{anno_prefix}- 子元素间距:")
             for a, bn, g in gaps[:10]:
-                lines.append(f"{gap_indent}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
+                lines.append(f"{anno_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
 
-    for child in sorted_children:
+    for idx, child in enumerate(sorted_children):
         child_path = f"{path} > {child.get('name', '')}" if path else child.get("name", "")
-        # 重复出现的可复用组件（非首个实例）：折叠为正文的一行引用，
-        # 完整结构见「可复用组件」章节，避免正文冗长重复。
         if reusable_ref and child_path in reusable_ref:
-            ref_indent = "  " * (depth + 1) if (depth + 1) > 2 else ""
-            lines.append(f"{ref_indent}{h[min(depth + 1, len(h) - 1)]} [复用] {child.get('name', '')} — 结构同上，详见「可复用组件 #{reusable_ref[child_path]}」")
+            connector = "└── " if idx == len(sorted_children) - 1 else "├── "
+            lines.append(f"{child_prefix}{connector}[复用] {child.get('name', '')} — 结构同上（与上方同类实例一致，已首次完整展开）")
             continue
-        _render(child, lines, depth + 1, path=child_path, reusable_ref=reusable_ref)
+        _render(child, lines, depth + 1, path=child_path, reusable_ref=reusable_ref,
+                prefix=child_prefix, is_last=(idx == len(sorted_children) - 1))
 
 
 def _collect_colors(node, cc):
