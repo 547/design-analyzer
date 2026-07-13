@@ -1177,7 +1177,7 @@ def _analyze_reusable_components(tree):
 def main():
     p = argparse.ArgumentParser(description="生成设计规格文档")
     p.add_argument("file", help="摹客 JSON 文件路径")
-    p.add_argument("-o", "--output", help="输出文件路径（默认调用目录下的 design-analyzer/spec_页面名.md）")
+    p.add_argument("-o", "--output", help="输出文件路径（默认输出到运行命令所在目录下的 design-analyzer/spec_页面名.md）")
     p.add_argument("-w", "--width", type=int, default=375, help="设计图宽度（默认 375px）")
     args = p.parse_args()
 
@@ -1191,7 +1191,8 @@ def main():
     if args.output:
         out_file = args.output
     else:
-        # 默认输出到调用目录下的 design-analyzer/ 子目录，自动创建
+        # 默认输出到「用户当前工作目录」下的 design-analyzer/ 子目录，自动创建。
+        # 注意：这里是用户运行命令时所在的目录（即项目目录），而非脚本/skill 所在目录。
         out_dir = os.path.join(os.getcwd(), "design-analyzer")
         os.makedirs(out_dir, exist_ok=True)
         out_file = os.path.join(out_dir, f"spec_{page_name}.md")

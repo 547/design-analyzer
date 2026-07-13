@@ -28,7 +28,7 @@ python3 scripts/generate_spec.py design.json
 ```
 
 **可选参数**：
-- `-o, --output <路径>`：自定义输出文件路径（默认输出到调用目录下的 `design-analyzer/spec_页面名.md`，目录不存在会自动创建）
+- `-o, --output <路径>`：自定义输出文件路径（默认输出到**你运行命令时所在目录（项目目录）**下的 `design-analyzer/spec_页面名.md`，目录不存在会自动创建。例如你在 `flutter-pin-module/` 中运行脚本，文档就生成到 `flutter-pin-module/design-analyzer/`，**不会**放到 skill 自身目录）
 - `-w, --width <数字>`：设计图基准宽度（默认 375，用于 rpx 换算参考）
 
 ### 步骤 3：阅读生成的规格文档
