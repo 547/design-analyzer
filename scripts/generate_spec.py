@@ -996,7 +996,7 @@ def _generate_impl_notes(tree):
             else:
                 notes.append(f"**配套卡片**：下方商品列表背景色与稿中一致（见列表区块 `bg`）")
             # 分隔线虚实：根据真实 dash 字段判断
-            dash_style = "虚线" if any(node.get("dash")) else "实线"
+            dash_style = "虚线" if (node.get("dash") is not None and len(node.get("dash")) > 0) else "实线"
             notes.append(f"**配套卡片**：商品列表复用普通商品卡片样式，卡片之间用**{dash_style}分隔**（单个商品块本身有 4px 圆角，整体不另加圆角容器）")
         
         # 检测白色背景的大区块（可能是信息区或商品区）
