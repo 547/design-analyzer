@@ -82,7 +82,7 @@ def get_dash(node):
 
 
 def get_text_info(node):
-    text_data = node.get("text", {})
+    text_data = node.get("text") or {}
     styles = text_data.get("styles", [])
     if not styles:
         chars = text_data.get("characters", "")
@@ -121,6 +121,14 @@ def get_blur(node):
 
 # ---- 扁平列表 → 嵌套树 ----
 
+def _get_parent_id(node):
+    """兼容 parentId 位于顶层或 basic 下的两种摹客导出格式。"""
+    pid = node.get("parentId")
+    if pid is not None:
+        return pid
+    return node.get("basic", {}).get("parentId")
+
+
 def build_tree_from_flat_list(flat_nodes):
     """将摹客的扁平图层列表转换为嵌套树结构。
     
@@ -144,7 +152,7 @@ def build_tree_from_flat_list(flat_nodes):
     root_nodes = []
 
     for node in flat_nodes:
-        pid = node.get("parentId")
+        pid = _get_parent_id(node)
         if pid and pid in node_map:
             if pid not in children_map:
                 children_map[pid] = []
@@ -152,6 +160,15 @@ def build_tree_from_flat_list(flat_nodes):
         else:
             # 没有 parentId 或 parentId 不在 node_map 中，视为根节点
             root_nodes.append(node)
+
+    # 把每个节点的 children 填充为其在 children_map 中的子节点，
+    # 否则只有根节点会被赋值、嵌套子节点全部丢失（导致深层结构与间距缺失）。
+    # 仅当节点原本没有 children 时才覆盖：若节点自带嵌套 children（如摹客导出
+    # 的 children 未重复入 flat 列表），保留其原有结构，避免被清空。
+    for node in flat_nodes:
+        nid = node.get("basic", {}).get("id", "")
+        if nid in children_map and not node.get("children"):
+            node["children"] = children_map[nid]
 
     # 如果有多个根节点，创建一个虚拟根
     if len(root_nodes) > 1:
@@ -764,39 +781,46 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         extra = " ".join(filter(None, [fs, fw, lh, align_str]))
         lines.append(f"{anno_prefix}- `{t['text']}`  {extra}  {fc}")
 
-    children = merge_repeats(node.get("children", []))
-    # Sort based on layout direction: horizontal layouts sort by left, vertical by top
+    raw_children = node.get("children", [])
+    # 排序规则（按布局方向），间距计算与渲染共用，保证顺序一致
     layout = node.get("layout", {})
-    if layout.get("type") == "horizontal":
-        if children and all(c.get("type") == "TEXT" for c in children):
-            sorted_children = sorted(
-                children,
-                key=lambda c: (c.get("bounds", {}).get("top", 0), c.get("bounds", {}).get("left", 0)),
-            )
-        else:
-            sorted_children = sorted(children, key=lambda c: c.get("bounds", {}).get("left", 0))
-    elif layout.get("type") == "grid":
-        sorted_children = sorted(children, key=lambda c: (c.get("bounds", {}).get("top", 0), c.get("bounds", {}).get("left", 0)))
-    else:
-        sorted_children = sorted(children, key=lambda c: c.get("bounds", {}).get("top", 0))
-    if len(sorted_children) > 1:
+
+    def sort_children(seq):
+        if layout.get("type") == "horizontal":
+            if seq and all(c.get("type") == "TEXT" for c in seq):
+                return sorted(seq, key=lambda c: (c.get("bounds", {}).get("top", 0), c.get("bounds", {}).get("left", 0)))
+            return sorted(seq, key=lambda c: c.get("bounds", {}).get("left", 0))
+        elif layout.get("type") == "grid":
+            return sorted(seq, key=lambda c: (c.get("bounds", {}).get("top", 0), c.get("bounds", {}).get("left", 0)))
+        return sorted(seq, key=lambda c: c.get("bounds", {}).get("top", 0))
+
+    # 间距基于「未合并的原始 children」计算：保留重复实例（×N 折叠会丢失组内间距），
+    # 避免把一组重复组件的总跨度误算成单段间距。
+    ordered_raw = sort_children(raw_children)
+    if len(ordered_raw) > 1:
         gaps = []
-        for i in range(len(sorted_children) - 1):
-            a_bn = sorted_children[i].get("bounds", {})
-            b_bn = sorted_children[i + 1].get("bounds", {})
-            a_bot = a_bn.get("top", 0) + a_bn.get("height", 0)
-            b_top = b_bn.get("top", 0)
-            g = round(b_top - a_bot, 1)
+        # 按布局方向选间距公式：水平布局取左右间隙，其余取上下间隙
+        is_h = layout.get("type") == "horizontal"
+        for i in range(len(ordered_raw) - 1):
+            a_bn = ordered_raw[i].get("bounds", {})
+            b_bn = ordered_raw[i + 1].get("bounds", {})
+            if is_h:
+                g = round(b_bn.get("left", 0) - (a_bn.get("left", 0) + a_bn.get("width", 0)), 1)
+            else:
+                g = round(b_bn.get("top", 0) - (a_bn.get("top", 0) + a_bn.get("height", 0)), 1)
             if g > 0:
-                a_name = sorted_children[i].get("name", "")
-                b_name = sorted_children[i + 1].get("name", "")
+                a_name = ordered_raw[i].get("name", "")
+                b_name = ordered_raw[i + 1].get("name", "")
                 gaps.append((a_name, b_name, g))
-        if gaps and depth > 0:
-            # 根节点（页面级）间距对实现无意义，且会打断树形连续性，跳过
-            # 间距列表与子节点树同级缩进（用 child_prefix），保持树形视觉连续
+        if gaps:
+            # 间距列表与子节点树同级缩进（用 child_prefix），保持树形视觉连续。
+            # 页面根节点下的区块间距（卡片间距/section 间距）对实现同样关键，不再跳过。
             lines.append(f"{child_prefix}- 子元素间距:")
             for a, bn, g in gaps[:10]:
                 lines.append(f"{child_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
+
+    children = merge_repeats(raw_children)
+    sorted_children = sort_children(children)
 
     for idx, child in enumerate(sorted_children):
         child_path = f"{path} > {child.get('name', '')}" if path else child.get("name", "")
