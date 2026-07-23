@@ -338,6 +338,80 @@ def detect_layout(children):
     return {"type": "mixed", "direction": "↕", "vertical_gaps": vertical_gaps, "horizontal_gaps": horizontal_gaps}
 
 
+# ---- 内边距推断 ----
+#
+# 当布局容器节点的尺寸明显大于其真实内容子元素所占范围时，差值通常由「内边距(padding)」
+# 撑开而非子元素留白。脚本用子元素坐标与容器边界的差值推断上下/左右 padding，仅在差值
+# 较小（内边距而非大留白）时输出，帮助开发直接用 padding 而非写死固定 height/width 实现。
+# 坐标法比「尺寸相减」更稳：能区分上下/左右 padding 是否相等，并排除与容器等大的背景矩形
+# （其不含内容、不占 padding）。不依赖 detect_layout 的方向判定——单内容 + 背景矩形这种
+# 场景 detect_layout 易误判，这里直接按垂直/水平两个方向各自的剩余空间分别计算。
+
+PADDING_INFER_MAX = 40  # 单侧内边距推断上限(px)：超过则视为大留白而非内边距
+
+
+def _is_icon_container(node):
+    """判断是否为纯图标容器（≤24px 且内部为图标切图）。
+
+    这类容器的「留白」是图标的视觉内边距，并非布局 padding，不应推断为内边距。
+    覆盖 FRAME 与 GROUP 两种类型（build_tree 对 FRAME 图标容器会设 icon_name，
+    但 GROUP 图标容器不会，故这里直接按尺寸+子节点类型判定，两处调用保持一致）。
+    """
+    bn = node.get("bounds", {})
+    if bn.get("width", 0) > 24 or bn.get("height", 0) > 24:
+        return False
+    children = node.get("children", [])
+    return any(c.get("component") == "Icon" or c.get("type") in ("VECTOR", "BITMAP")
+               for c in children)
+
+
+def _infer_padding(node):
+    """推断容器的上下/左右内边距（不依赖布局方向，分别按两个主轴计算剩余空间）。
+
+    返回 dict：{'vertical': {'top','bottom','valid'}, 'horizontal': {'left','right','valid'}}。
+    某方向 valid=True 表示单侧剩余均 >0 且 <= PADDING_INFER_MAX，可作为内边距给出。
+    仅对含内容子节点的布局容器生效；排除与容器等大的背景矩形。
+    """
+    bn = node.get("bounds", {})
+    cw, ch = bn.get("width", 0), bn.get("height", 0)
+    children = [c for c in node.get("children", []) if c.get("bounds")]
+
+    def empty():
+        return {"top": 0, "bottom": 0, "left": 0, "right": 0, "valid": False}
+
+    if len(children) < 1 or cw <= 0 or ch <= 0:
+        return {"vertical": empty(), "horizontal": empty()}
+
+    # 背景矩形：尺寸与容器几乎相等（容差 0.5px）且只是填充块，不计入内容边界。
+    def is_bg_rect(c):
+        cb = c.get("bounds", {})
+        return (c.get("type") in ("RECTANGLE", "VECTOR")
+                and abs(cb.get("width", 0) - cw) <= 0.5
+                and abs(cb.get("height", 0) - ch) <= 0.5)
+
+    content = [c for c in children if not is_bg_rect(c)]
+    if not content:
+        content = children
+
+    tops = [c.get("bounds", {}).get("top", 0) for c in content]
+    bottoms = [c.get("bounds", {}).get("top", 0) + c.get("bounds", {}).get("height", 0) for c in content]
+    lefts = [c.get("bounds", {}).get("left", 0) for c in content]
+    rights = [c.get("bounds", {}).get("left", 0) + c.get("bounds", {}).get("width", 0) for c in content]
+
+    top = round(min(tops) - bn.get("top", 0))
+    bottom = round(bn.get("top", 0) + ch - max(bottoms))
+    left = round(min(lefts) - bn.get("left", 0))
+    right = round(bn.get("left", 0) + cw - max(rights))
+
+    v_valid = 0 < top <= PADDING_INFER_MAX and 0 < bottom <= PADDING_INFER_MAX
+    h_valid = 0 < left <= PADDING_INFER_MAX and 0 < right <= PADDING_INFER_MAX
+
+    return {
+        "vertical": {"top": top, "bottom": bottom, "valid": v_valid},
+        "horizontal": {"left": left, "right": right, "valid": h_valid},
+    }
+
+
 # ---- 树结构 ----
 
 def has_content(node):
@@ -819,6 +893,23 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
             for a, bn, g in gaps[:10]:
                 lines.append(f"{child_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
 
+    # 内边距推断：仅当某方向差值较小（内边距而非大留白）时注解。
+    # 纯图标容器的"留白"是图标视觉内边距，非布局 padding，跳过。
+    pad = {"vertical": {"top": 0, "bottom": 0, "valid": False},
+           "horizontal": {"left": 0, "right": 0, "valid": False}} if _is_icon_container(node) else _infer_padding(node)
+    if pad["vertical"]["valid"]:
+        vt, vb = pad["vertical"]["top"], pad["vertical"]["bottom"]
+        if vt == vb:
+            lines.append(f"{anno_prefix}- [内边距] 上下各 {vt}px（容器高度由子元素高度 + 上下 padding 撑开）")
+        else:
+            lines.append(f"{anno_prefix}- [内边距] 上 {vt}px / 下 {vb}px（上下 padding 不等，容器高度由子元素 + padding 撑开）")
+    if pad["horizontal"]["valid"]:
+        vl, vr = pad["horizontal"]["left"], pad["horizontal"]["right"]
+        if vl == vr:
+            lines.append(f"{anno_prefix}- [内边距] 左右各 {vl}px（容器宽度由子元素宽度 + 左右 padding 撑开）")
+        else:
+            lines.append(f"{anno_prefix}- [内边距] 左 {vl}px / 右 {vr}px")
+
     children = merge_repeats(raw_children)
     sorted_children = sort_children(children)
 
@@ -953,6 +1044,26 @@ def _generate_impl_notes(tree):
         bn = node.get("bounds", {})
         texts = node.get("texts", [])
         
+        # 内边距撑开提示：容器尺寸由子元素 + padding 撑开时，建议用 padding
+        # 而非写死固定 height/width（与分隔线/吸底等要点风格一致）。
+        if comp_type in ("Container", "Card", "List Item", "Form Row", "Button", "Navigation"):
+            # 纯图标容器（≤24px，内部为图标切图）的"留白"是图标视觉内边距，
+            # 非布局 padding，不进实现要点，避免误导。
+            pad = {"vertical": {"top": 0, "bottom": 0, "valid": False},
+                   "horizontal": {"left": 0, "right": 0, "valid": False}} if _is_icon_container(node) else _infer_padding(node)
+            pad_notes = []
+            if pad["vertical"]["valid"]:
+                vt, vb = pad["vertical"]["top"], pad["vertical"]["bottom"]
+                pad_notes.append((f"上下各 {vt}px" if vt == vb else f"上 {vt}px / 下 {vb}px", "height"))
+            if pad["horizontal"]["valid"]:
+                vl, vr = pad["horizontal"]["left"], pad["horizontal"]["right"]
+                pad_notes.append((f"左右各 {vl}px" if vl == vr else f"左 {vl}px / 右 {vr}px", "width"))
+            for pad_desc, axis in pad_notes:
+                notes.append(
+                    f"**内边距撑开**（`{nname or comp_type}`）：尺寸 {bn.get('width',0):.0f}×{bn.get('height',0):.0f}px"
+                    f"由子元素 + {pad_desc} 内边距撑开，建议用 `padding` 实现而非写死固定{axis}"
+                )
+
         # 检测 info-row 类型（Form Row 或 Text Block 的字段行）
         if comp_type in ("Form Row", "Text Block") and len(children) >= 2:
             # 基于真实数据判断字段行之间是否有分隔线：仅认 component==Divider
