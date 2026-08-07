@@ -101,6 +101,16 @@ def get_border_count(node):
     return len(node.get("stroke", {}).get("borders", []))
 
 
+def get_border_info(node):
+    """返回边框详情列表，每项形如 '1px #EAE9E9'（宽度 + 颜色），供内联输出。"""
+    out = []
+    for b in node.get("stroke", {}).get("borders", []):
+        w = b.get("strokeWidth", 1)
+        c = to_hex(b.get("color", {}).get("value", {}))
+        out.append(f"{w}px {c}")
+    return out
+
+
 def get_dash(node):
     """返回描边虚线样式；空列表/None 表示实线。"""
     d = node.get("stroke", {}).get("dash", [])
@@ -171,12 +181,14 @@ def get_autolayout(node):
         return al
     if "layoutSizingHorizontal" not in al:
         return None
+    has_pad = any(k in al for k in
+                  ("paddingLeft", "paddingTop", "paddingRight", "paddingBottom"))
     pad = {
         "left": al.get("paddingLeft", 0) or 0,
         "top": al.get("paddingTop", 0) or 0,
         "right": al.get("paddingRight", 0) or 0,
         "bottom": al.get("paddingBottom", 0) or 0,
-    }
+    } if has_pad else None  # 精简版无 padding 字段：不伪造为 0，交由坐标法回退
     return {
         "sizing_h": al.get("layoutSizingHorizontal", ""),
         "sizing_v": al.get("layoutSizingVertical", ""),
@@ -503,7 +515,7 @@ def _infer_padding(node):
     autoLayout 缺失时才回退坐标差值法。
     """
     al = get_autolayout(node)
-    if al is not None:
+    if al is not None and al["padding"] is not None:
         pad = al["padding"]
         # 仅 HUG（内容撑开）方向才可能是 padding 撑开；FIXED 是定宽定高，不标 padding
         v_valid = al["sizing_v"] == "HUG" and (pad["top"] > 0 or pad["bottom"] > 0)
@@ -603,6 +615,7 @@ def build_tree(node, depth=0):
             return {
                 "type": ntype, "name": nname, "bounds": bn,
                 "fills": fills, "radius": radius, "borders": borders,
+                "border_info": get_border_info(node),
                 "dash": get_dash(node),
                 "texts": [], "children": [], "component": comp_type,
                 "icon_name": icon_name,
@@ -672,6 +685,7 @@ def build_tree(node, depth=0):
     return {
         "type": ntype, "name": nname, "bounds": bn,
         "fills": fills, "radius": radius, "borders": borders,
+        "border_info": get_border_info(node),
         "dash": get_dash(node),
         "opacity": opacity, "blur": blur,
         "texts": [], "children": children, "component": comp_type,
@@ -889,87 +903,6 @@ def generate(root, design_width=375):
     return "\n".join(lines)
 
 
-def _infer_semantic(node):
-    """从节点自身与子树结构推断业务语义标签（纯 JSON 驱动，不写死业务名）。
-
-    只在高置信度命中结构模式时返回标签；不确定返回 ""。对仅凭位置/形态推测、
-    但 JSON 无明确文字佐证的，用「推测：」前缀区分，避免伪造确定信息。
-    """
-    name = node.get("name", "")
-    comp = node.get("component", "")
-    ntype = node.get("type", "")
-    texts = [t.get("text", "") for t in node.get("texts", [])]
-    children = node.get("children", [])
-
-    def collect_texts(n):
-        out = [t.get("text", "") for t in n.get("texts", [])]
-        for c in n.get("children", []):
-            out.extend(collect_texts(c))
-        return out
-
-    all_txt = collect_texts(node)
-    all_lower = [t.lower() for t in all_txt]
-    name_lower = name.lower()
-
-    # 1. Switch 开关：自身或子树含 on/off 文本，或名称含 switch/开关
-    if "switch" in name_lower or "开关" in name:
-        return "Switch 开关"
-    if any(t in ("on", "off", "开启", "关闭") for t in all_lower):
-        # 仅当节点较小（开关形态）才标，避免误伤含 on/off 文字的区块
-        bn = node.get("bounds", {})
-        if 0 < bn.get("width", 0) <= 80 and 0 < bn.get("height", 0) <= 60:
-            return "Switch 开关"
-
-    # 2. 数量选择器：含 [-] 与 [+] 文本（或图标名），且附近有输入框
-    has_minus = any("-" in t or "minus" in t.lower() for t in all_lower)
-    has_plus = any("+" in t or "plus" in t.lower() for t in all_lower)
-    if has_minus and has_plus:
-        return "数量选择器"
-
-    # 3. 顶部/标题栏：位于页面顶部（top 较小）且含返回按钮 + 居中标题文本
-    bn = node.get("bounds", {})
-    if bn.get("top", 0) <= 100 and bn.get("width", 0) >= 300:
-        has_back = "fanhui" in name_lower or "返回" in name_lower or any("fanhui" in t.lower() for t in all_lower)
-        has_title_text = any(len(t) >= 2 and t not in ("on", "off") for t in all_txt)
-        if has_back and has_title_text:
-            return "顶部栏"
-
-    # 4. 底部操作栏：位于页面底部（top 接近页面高度）且含按钮形态子节点
-    root_h = node.get("_root_height", 0)
-    if root_h and bn.get("top", 0) > root_h - 120 and bn.get("width", 0) >= 300:
-        btn_like = any(c.get("component") in ("Button", "Navigation") or
-                       "按钮" in c.get("name", "") or "button" in c.get("name", "").lower()
-                       for c in children)
-        if btn_like:
-            return "推测：底部操作栏"
-
-    # 5. 卡片语义：白色/浅色背景 + 圆角 + 较大内容容器（高度>80 且含多个子结构）
-    #    业务名取**卡片直接子文本**中字号最大者（标题在卡片直接层级，而非深层表格数据/按钮文字）；
-    #    若直接子层无合适标题文本，说明无法可靠判定业务名，遵循「判断不了就不输出」，不臆测。
-    fills = node.get("fills", [])
-    radius = node.get("radius", [])
-    if (not fills or fills[0].upper() in ("#FFFFFF", "#F7F8FA", "#FAFAFA", "#F6F6F6")) and radius:
-        if bn.get("height", 0) > 80 and len(children) >= 2:
-            has_form = any(c.get("component") in ("Form Row", "Text Block", "Container", "Card")
-                           for c in children)
-            if has_form:
-                # 直接子文本（node 自身的 texts，非子树递归），按字号降序选标题候选
-                direct = node.get("texts", [])
-                title_candidate = ""
-                best_fs = -1
-                for t in direct:
-                    txt = t.get("text", "")
-                    if len(txt) >= 2 and txt not in ("on", "off") and not txt.isdigit():
-                        fs = t.get("fontSize") or 0
-                        if fs > best_fs:
-                            best_fs = fs
-                            title_candidate = txt
-                if title_candidate:
-                    return f"卡片（{title_candidate}）"
-
-    return ""
-
-
 def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last=True):
     name = node["name"]
     bn = node["bounds"]
@@ -985,9 +918,9 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     radius = node.get("radius", [])
     if radius:
         flags.append(f"r={radius}")
-    borders = node.get("borders", 0)
+    borders = node.get("border_info", [])
     if borders:
-        flags.append(f"border={borders}")
+        flags.append(f"border={' / '.join(borders)}")
     opacity = node.get("opacity", 1)
     if opacity < 1:
         flags.append(f"opacity={opacity}")
@@ -1015,10 +948,6 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
             if hpad.get("valid"):
                 width_flag = "内容撑开"
 
-    # 业务语义标注（纯 JSON 驱动，保留图层名可溯源）
-    semantic = _infer_semantic(node)
-    sem_str = f"（语义：{semantic}）" if semantic else ""
-
     # 树形连接符：根节点无前缀；其余用 ├── / └──
     if depth == 0:
         connector = ""
@@ -1026,7 +955,7 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         connector = "└── " if is_last else "├── "
 
     wflag_str = f" [{width_flag}]" if width_flag else ""
-    lines.append(f"{prefix}{connector}{name}{sem_str} {w:.0f}×{ht:.0f}px{wflag_str}{flag_str}")
+    lines.append(f"{prefix}{connector}{name} {w:.0f}×{ht:.0f}px{wflag_str}{flag_str}")
 
     # 子节点/注解的缩进前缀：当前层级往下传 ┊/空格
     child_prefix = prefix
@@ -1310,7 +1239,6 @@ def _generate_impl_notes(tree):
         "文档「页面结构」树中标注 `[内边距]` 的容器，其尺寸由子元素 + 上下/左右 padding 撑开，"
         "实现时用 `padding` 即可（精确值见树内 [内边距] 标注）。仅两种例外才写死："
         "① 脚本对该容器尺寸/内容识别不稳定、实现时可能崩溃或报错；② 用户明确要求固定值。"
-        "（表格等设计稿定宽节点的宽度已内联在节点 bounds 上，照写即可，无需自适应。）"
     )
     notes.insert(0, default_principle)
 
