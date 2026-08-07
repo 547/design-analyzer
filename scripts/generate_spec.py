@@ -263,7 +263,7 @@ def build_tree_from_flat_list(flat_nodes):
 
 # ---- 组件类型推断 ----
 
-def infer_component_type(node, context=""):
+def infer_component_type(node):
     ntype = get_type(node)
     nname = get_name(node)
     fills = get_fill_colors(node)
@@ -388,7 +388,6 @@ def detect_layout(children, node=None):
     top_variance = max(tops) - min(tops)
     left_variance = max(lefts) - min(lefts)
     
-    avg_width = sum(widths) / len(widths)
     avg_height = sum(heights) / len(heights)
     
     is_grid = False
@@ -507,7 +506,7 @@ def build_tree(node, depth=0):
     nname = get_name(node)
     bn = get_bounds(node)
     
-    comp_type = infer_component_type(node, nname)
+    comp_type = infer_component_type(node)
 
     if ntype == "TEXT":
         ti = get_text_info(node)
@@ -877,7 +876,7 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
             # 页面根节点下的区块间距（卡片间距/section 间距）对实现同样关键，不再跳过。
             lines.append(f"{child_prefix}- 子元素间距:")
             for a, b_name, g in gaps[:10]:
-                lines.append(f"{child_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
+                lines.append(f"{child_prefix}  - {a} → {b_name}: {g}px ({px2rpx(g)}rpx)")
 
     # 纯文本容器（children 已内联为文字行）：子元素间距来自 autoLayout 的 itemSpacing，
     # 因 raw_children 为空、坐标法失效，改用 autoLayout 权威值直接输出，避免纵向排布的
