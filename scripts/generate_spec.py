@@ -33,7 +33,23 @@ COMP_TYPE_ALIASES = {
 
 
 def to_hex(rgb):
-    return f"#{round(rgb['r']):02X}{round(rgb['g']):02X}{round(rgb['b']):02X}"
+    # 兼容缺字段/越界值（clamp 到 0-255），不崩溃；保留 alpha 通道
+    def _ch(k):
+        v = rgb.get(k, 0)
+        try:
+            v = int(round(v))
+        except (TypeError, ValueError):
+            v = 0
+        return max(0, min(255, v))
+    r, g, b = _ch("r"), _ch("g"), _ch("b")
+    a = rgb.get("a", 1)
+    try:
+        a = float(a)
+    except (TypeError, ValueError):
+        a = 1
+    if a < 1:
+        return f"rgba({r},{g},{b},{round(a, 2)})"
+    return f"#{r:02X}{g:02X}{b:02X}"
 
 
 def px2rpx(px, design_width=375):
@@ -68,7 +84,17 @@ def get_fill_colors(node):
 
 def get_radius(node):
     r = node.get("stroke", {}).get("radius", [])
-    return r if r and r not in ([0], [0, 0, 0, 0]) else []
+    if not r or r in ([0], [0, 0, 0, 0]):
+        return []
+    # 收敛浮点噪声（如 2.6666667 → 2.7），整型保持整型
+    clean = []
+    for v in r:
+        if isinstance(v, float):
+            rv = round(v, 1)
+            clean.append(int(rv) if rv == int(rv) else rv)
+        else:
+            clean.append(v)
+    return clean
 
 
 def get_border_count(node):
@@ -81,9 +107,21 @@ def get_dash(node):
     return d if d else []
 
 
+_ALIGN_MAP = {"LEFT": "左", "CENTER": "居中", "RIGHT": "右", "JUSTIFY": "两端"}
+
+
+def _map_align(raw):
+    """摹客 JSON 文字对齐字段名为 align（值 LEFT/CENTER/RIGHT），映射为中文。"""
+    if not raw:
+        return ""
+    return _ALIGN_MAP.get(str(raw).upper(), "")
+
+
 def get_text_info(node):
     text_data = node.get("text") or {}
     styles = text_data.get("styles", [])
+    # 文字几何位置（用于对齐推断）：一个 TEXT 节点通常对应一个 bounds
+    nb = get_bounds(node)
     if not styles:
         chars = text_data.get("characters", "")
         if chars:
@@ -92,6 +130,7 @@ def get_text_info(node):
                 "fontSize": None,
                 "fontWeight": None,
                 "color": "",
+                "_bounds": nb,
             }]
         return []
 
@@ -106,17 +145,106 @@ def get_text_info(node):
             "fontWeight": font.get("fontWeight") or font.get("weight"),
             "color": color_hex,
             "lineHeight": s.get("space", {}).get("lineHeight"),
-            "alignment": s.get("alignment"),
+            "alignment": _map_align(s.get("align")),
+            "_bounds": nb,
         })
     return result
 
 
 def get_opacity(node):
-    return node.get("opacity", 1)
+    # 摹客 JSON 透明度在 basic.opacity，不在顶层
+    return node.get("basic", {}).get("opacity", 1)
+
+
+def get_autolayout(node):
+    """返回归一化的 autoLayout 信息（摹客权威尺寸/padding 来源）。
+
+    字段：sizing_h / sizing_v（HUG/FIXED）、layout_mode（HORIZONTAL/VERTICAL）、
+    padding（{left,top,right,bottom}，缺失键按 0）、item_spacing（子元素间距）。
+    节点无 autoLayout 时返回 None（调用方回退坐标法）。
+    """
+    al = node.get("autolayout") or node.get("autoLayout")
+    if not isinstance(al, dict):
+        return None
+    # 兼容已归一化格式（含 sizing_h 键，由 build_tree 预存）与原始 autoLayout 格式
+    if "sizing_h" in al:
+        return al
+    if "layoutSizingHorizontal" not in al:
+        return None
+    pad = {
+        "left": al.get("paddingLeft", 0) or 0,
+        "top": al.get("paddingTop", 0) or 0,
+        "right": al.get("paddingRight", 0) or 0,
+        "bottom": al.get("paddingBottom", 0) or 0,
+    }
+    return {
+        "sizing_h": al.get("layoutSizingHorizontal", ""),
+        "sizing_v": al.get("layoutSizingVertical", ""),
+        "layout_mode": al.get("layoutMode", ""),
+        "padding": pad,
+        "item_spacing": al.get("itemSpacing", 0) or 0,
+    }
 
 
 def get_blur(node):
     return node.get("blur", {}).get("radius", 0)
+
+
+# ---- 交互说明 / 标注线识别 ----
+#
+# 摹客设计稿里，设计师常把「给开发的批注」当作普通图层放在画布上：
+#   - 说明文字：如「多个标签宽度超出，可以左右滑动」「适用销司超过三个显示查看更多」
+#     这类是交互行为描述，不是要实现的 UI 元素；
+#   - 标注引线：名为 Arrow N 的 1px 高 VECTOR，是连接批注与元素的指示线。
+# 这些节点若混进结构树，AI 会误当成 UI 实现，还会污染间距/字段行分析。
+# 故识别后打 annotation 标记：不进「页面结构」树，单独抽成「交互行为」节。
+
+ANNOTATION_KEYWORDS = (
+    "可以左右滑动", "超出，可以", "超过三个", "显示『查看更多』", "弹窗显示全部",
+    "可左右滑动", "横向滑动", "可滑动",
+)
+
+
+def _is_annotation_text(node):
+    if node.get("type") != "TEXT":
+        return False
+    # 保守约束：带背景填充或边框的文字节点视为真实 UI 元素（如「查看全部」按钮），
+    # 不当批注剔除——避免静默漏做真实按钮。仅裸文字（无 fills/borders）才可能是批注。
+    if node.get("fills") or node.get("borders"):
+        return False
+    txt = " ".join(t.get("text", "") for t in node.get("texts", []))
+    return any(k in txt for k in ANNOTATION_KEYWORDS)
+
+
+def _is_annotation_line(node):
+    """标注引线：名为 Arrow N 的极细线（高度 ≤ 2px）。"""
+    nname = node.get("name", "")
+    if not nname.startswith("Arrow"):
+        return False
+    bn = node.get("bounds", {})
+    return bn.get("height", 0) <= 2
+
+
+def _is_annotation(node):
+    return _is_annotation_text(node) or _is_annotation_line(node)
+
+
+def _mark_annotations(node):
+    """递归给交互说明/标注线节点打 annotation 标记（build_tree 之后调用）。"""
+    if _is_annotation(node):
+        node["annotation"] = True
+    for c in node.get("children", []):
+        _mark_annotations(c)
+
+
+def _collect_annotations(node, out):
+    """收集所有 annotation 节点（用于独立「交互行为」节）。"""
+    if node.get("annotation"):
+        out.append(node)
+    for c in node.get("children", []):
+        _collect_annotations(c, out)
+
+
 
 
 # ---- 扁平列表 → 嵌套树 ----
@@ -369,9 +497,22 @@ def _infer_padding(node):
     """推断容器的上下/左右内边距（不依赖布局方向，分别按两个主轴计算剩余空间）。
 
     返回 dict：{'vertical': {'top','bottom','valid'}, 'horizontal': {'left','right','valid'}}。
-    某方向 valid=True 表示单侧剩余均 >0 且 <= PADDING_INFER_MAX，可作为内边距给出。
-    仅对含内容子节点的布局容器生效；排除与容器等大的背景矩形。
+    某方向 valid=True 表示应作为内边距给出（值已在对应 top/bottom/left/right）。
+
+    优先用摹客 autoLayout 权威 padding（且只有 HUG 方向才可能 padding 撑开）；
+    autoLayout 缺失时才回退坐标差值法。
     """
+    al = get_autolayout(node)
+    if al is not None:
+        pad = al["padding"]
+        # 仅 HUG（内容撑开）方向才可能是 padding 撑开；FIXED 是定宽定高，不标 padding
+        v_valid = al["sizing_v"] == "HUG" and (pad["top"] > 0 or pad["bottom"] > 0)
+        h_valid = al["sizing_h"] == "HUG" and (pad["left"] > 0 or pad["right"] > 0)
+        return {
+            "vertical": {"top": pad["top"], "bottom": pad["bottom"], "valid": v_valid},
+            "horizontal": {"left": pad["left"], "right": pad["right"], "valid": h_valid},
+        }
+
     bn = node.get("bounds", {})
     cw, ch = bn.get("width", 0), bn.get("height", 0)
     children = [c for c in node.get("children", []) if c.get("bounds")]
@@ -439,7 +580,9 @@ def build_tree(node, depth=0):
     if ntype == "TEXT":
         ti = get_text_info(node)
         if ti:
-            return {"type": ntype, "name": nname, "bounds": bn, "texts": ti, "children": [], "component": comp_type}
+            # 带 fills/borders，供 _is_annotation_text 判断「带底色的文字不当批注」（避免吞真实按钮）
+            return {"type": ntype, "name": nname, "bounds": bn, "texts": ti, "children": [],
+                    "component": comp_type, "fills": get_fill_colors(node), "borders": get_border_count(node)}
         return None
 
     if ntype not in ("FRAME", "GROUP"):
@@ -503,7 +646,13 @@ def build_tree(node, depth=0):
         )
         texts = []
         for c in ordered:
-            texts.extend(c.get("texts", []))
+            cb = c.get("bounds", {})
+            for t in c.get("texts", []):
+                # 保留文字几何位置（用于对齐推断）：摹客常无 alignment 字段，
+                # 渲染时据文字中心相对容器中心推断 居中/左/右。
+                t = dict(t)
+                t["_bounds"] = cb
+                texts.append(t)
         tcolors = []
         for c in children:
             for t in c.get("texts", []):
@@ -515,6 +664,7 @@ def build_tree(node, depth=0):
             "dash": get_dash(node),
             "opacity": opacity, "blur": blur,
             "texts": texts, "children": [], "component": comp_type,
+            "autolayout": get_autolayout(node),
         }
 
     layout_info = detect_layout(children)
@@ -527,6 +677,7 @@ def build_tree(node, depth=0):
         "texts": [], "children": children, "component": comp_type,
         "layout": layout_info,
         "icon_name": icon_name,
+        "autolayout": get_autolayout(node),
     }
 
 
@@ -663,10 +814,13 @@ def generate_development_tasks(tree):
 
 def generate(root, design_width=375):
     tree = build_tree(root)
-    tree["_root_height"] = get_bounds(root).get("height", 0)
     if not tree:
         tree = {"type": "FRAME", "name": "Root", "bounds": get_bounds(root),
                 "fills": get_fill_colors(root), "texts": [], "children": [], "component": "Container"}
+    tree["_root_height"] = get_bounds(root).get("height", 0)
+
+    # 标记交互说明/标注线节点（不进结构树，单独抽成「交互行为」节）
+    _mark_annotations(tree)
 
     lines = []
     lines.append("# 设计规格文档\n")
@@ -683,8 +837,13 @@ def generate(root, design_width=375):
             content_w = cw
     if content_w and bn["width"]:
         side_pad = round((bn["width"] - content_w) / 2)
-        if side_pad > 0:
+        # 单侧留白需同时满足：不超过页宽 15%，且不超过内边距推断上限（PADDING_INFER_MAX），
+        # 才视为真实内容 padding；否则判定为画布留白（绝对量概念，用绝对上限兜底，
+        # 避免大屏稿阈值被放大到几百 px 仍误判为 padding）。
+        if 0 < side_pad <= min(bn["width"] * 0.15, PADDING_INFER_MAX):
             lines.append(f"**内容区**: 宽 {content_w:.0f}px 居中，左右各 {side_pad}px padding（{content_w:.0f}×…px 容器）")
+        elif content_w < bn["width"]:
+            lines.append(f"**内容区**: 宽 {content_w:.0f}px（页面总宽 {bn['width']:.0f}px，左右含画布留白，非内容 padding）")
     lines.append("")
 
     # 可复用组件分析（提前计算，用于正文折叠重复实例）
@@ -697,6 +856,19 @@ def generate(root, design_width=375):
 
     lines.append("\n---\n## 页面结构")
     _render(tree, lines, 0, path=tree.get("name", ""), reusable_ref=reusable_ref)
+
+    # 交互行为（设计师批注/标注线，非要实现 UI 元素，单独成节避免误导实现）
+    annotations = []
+    _collect_annotations(tree, annotations)
+    if annotations:
+        lines.append("\n---\n## 交互行为")
+        lines.append("> 以下为设计稿中的交互说明/标注线（设计师批注），**不是要实现的 UI 节点**，仅供理解交互逻辑。")
+        for a in annotations:
+            if a.get("type") == "TEXT":
+                txt = " ".join(t.get("text", "") for t in a.get("texts", []))
+                lines.append(f"- {txt}")
+            else:
+                lines.append(f"- 标注线 `{a.get('name', '')}`（连接批注与元素，无需实现）")
 
     # 实现要点（跨节点/行为级约束，页面结构树无法体现的全局提示，开发照稿实现必需）
     impl_notes = _generate_impl_notes(tree)
@@ -798,8 +970,10 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     comp_type = node.get("component", "")
 
     flags = []
+    # TEXT 节点的 fills 是字体颜色（已在文字行以 #色值 呈现），不是背景，勿输出 bg=
+    is_text = node.get("type") == "TEXT"
     fills = node.get("fills", [])
-    if fills:
+    if fills and not is_text:
         flags.append(f"bg={','.join(fills)}")
     radius = node.get("radius", [])
     if radius:
@@ -822,6 +996,18 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
 
     flag_str = f" ({'; '.join(flags)})" if flags else ""
 
+    # 宽度意图旗标：优先用摹客 autoLayout 权威判断（HUG=内容撑开），无 autoLayout 回退坐标法。
+    width_flag = ""
+    if w > 0 and node.get("children"):
+        al = get_autolayout(node)
+        if al is not None:
+            if al["sizing_h"] == "HUG":
+                width_flag = "内容撑开"
+        else:
+            hpad = _infer_padding(node).get("horizontal", {})
+            if hpad.get("valid"):
+                width_flag = "内容撑开"
+
     # 业务语义标注（纯 JSON 驱动，保留图层名可溯源）
     semantic = _infer_semantic(node)
     sem_str = f"（语义：{semantic}）" if semantic else ""
@@ -832,7 +1018,8 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     else:
         connector = "└── " if is_last else "├── "
 
-    lines.append(f"{prefix}{connector}{name}{sem_str} {w:.0f}×{ht:.0f}px{flag_str}")
+    wflag_str = f" [{width_flag}]" if width_flag else ""
+    lines.append(f"{prefix}{connector}{name}{sem_str} {w:.0f}×{ht:.0f}px{wflag_str}{flag_str}")
 
     # 子节点/注解的缩进前缀：当前层级往下传 ┊/空格
     child_prefix = prefix
@@ -851,11 +1038,40 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         fc = t.get("color", "")
         lh = f"lh={t['lineHeight']}" if t.get("lineHeight") else ""
         alignment = t.get("alignment", "")
+        if not alignment:
+            # 摹客常无 alignment 字段：据文字中心相对容器中心的水平位置推断对齐，
+            # 避免表头/标题类节点对齐缺失导致开发瞎猜。
+            tb = t.get("_bounds") or {}
+            if tb and w > 0:
+                t_left = tb.get("left", 0)
+                t_w = tb.get("width", 0)
+                t_right = t_left + t_w
+                p_left = bn.get("left", 0)
+                p_right = p_left + w
+                left_margin = t_left - p_left
+                right_margin = p_right - t_right
+                if abs(left_margin - right_margin) <= max(4, w * 0.12):
+                    alignment = "居中"
+                elif left_margin <= right_margin:
+                    alignment = "左"
+                else:
+                    alignment = "右"
         align_str = f"align={alignment}" if alignment else ""
         extra = " ".join(filter(None, [fs, fw, lh, align_str]))
         lines.append(f"{anno_prefix}- `{t['text']}`  {extra}  {fc}")
 
-    raw_children = node.get("children", [])
+    raw_children = [c for c in node.get("children", []) if not c.get("annotation")]
+
+    # 过滤纯空节点：摹客共享样式/变体组件的子节点有时未随实例还原（build_tree 后
+    # children 为空），这类节点无子、无文字、无样式，对实现零价值，渲染成空格子反而误导开发。
+    def _is_empty_node(c):
+        return (
+            not c.get("children") and not c.get("texts")
+            and not c.get("fills") and not c.get("borders")
+            and not c.get("radius") and c.get("opacity", 1) >= 1
+            and not c.get("blur") and not c.get("icon_name")
+        )
+    raw_children = [c for c in raw_children if not _is_empty_node(c)]
     # 排序规则（按布局方向），间距计算与渲染共用，保证顺序一致
     layout = node.get("layout", {})
 
@@ -1000,27 +1216,6 @@ def _collect_all_icons(node, parent_name="", icons=None):
     return icons
 
 
-def _guess_asset_name(icon_name):
-    """根据图标名称推测对应的切图文件名（SVG/PNG/JPG/WebP）。"""
-    name_map = {
-        "路径 2": "fanhui.svg",
-        "Cap": "编组 7.svg",
-        "Frame": "Frame.svg",
-    }
-    if icon_name in name_map:
-        return name_map[icon_name]
-    # 尝试模糊匹配
-    name_lower = icon_name.lower()
-    if "返回" in icon_name or "fanhui" in name_lower or "back" in name_lower:
-        return "fanhui.svg"
-    if "更多" in icon_name or "more" in name_lower or "cap" in name_lower:
-        return "编组 7.svg"
-    if "配套" in icon_name or "frame" in name_lower:
-        return "Frame.svg"
-    # 默认返回原始名称，不限制扩展名
-    return f"{icon_name}.*"
-
-
 def _generate_impl_notes(tree):
     """生成实现要点，帮助开发者快速准确地实现设计稿。"""
     notes = []
@@ -1037,108 +1232,26 @@ def _generate_impl_notes(tree):
         comp_type = node.get("component", "")
         nname = node.get("name", "")
         fills = node.get("fills", [])
-        radius = node.get("radius", [])
         borders = node.get("borders", 0)
         children = node.get("children", [])
-        layout = node.get("layout", {})
         bn = node.get("bounds", {})
-        texts = node.get("texts", [])
-        
-        # 内边距撑开提示：容器尺寸由子元素 + padding 撑开时，建议用 padding
-        # 而非写死固定 height/width（与分隔线/吸底等要点风格一致）。
-        if comp_type in ("Container", "Card", "List Item", "Form Row", "Button", "Navigation"):
-            # 纯图标容器（≤24px，内部为图标切图）的"留白"是图标视觉内边距，
-            # 非布局 padding，不进实现要点，避免误导。
-            pad = {"vertical": {"top": 0, "bottom": 0, "valid": False},
-                   "horizontal": {"left": 0, "right": 0, "valid": False}} if _is_icon_container(node) else _infer_padding(node)
-            pad_notes = []
-            if pad["vertical"]["valid"]:
-                vt, vb = pad["vertical"]["top"], pad["vertical"]["bottom"]
-                pad_notes.append((f"上下各 {vt}px" if vt == vb else f"上 {vt}px / 下 {vb}px", "height"))
-            if pad["horizontal"]["valid"]:
-                vl, vr = pad["horizontal"]["left"], pad["horizontal"]["right"]
-                pad_notes.append((f"左右各 {vl}px" if vl == vr else f"左 {vl}px / 右 {vr}px", "width"))
-            for pad_desc, axis in pad_notes:
-                notes.append(
-                    f"**内边距撑开**（`{nname or comp_type}`）：尺寸 {bn.get('width',0):.0f}×{bn.get('height',0):.0f}px"
-                    f"由子元素 + {pad_desc} 内边距撑开，建议用 `padding` 实现而非写死固定{axis}"
-                )
 
         # 检测 info-row 类型（Form Row 或 Text Block 的字段行）
-        if comp_type in ("Form Row", "Text Block") and len(children) >= 2:
+        # 排除表格单元格：自身或子节点带 border 的格子是表格列，不是信息字段行
+        _is_table_cell = borders > 0 or any(c.get("borders", 0) for c in children)
+        if comp_type in ("Form Row", "Text Block") and len(children) >= 2 and not _is_table_cell:
             # 基于真实数据判断字段行之间是否有分隔线：仅认 component==Divider
             # （由 infer_component_type 按 height<=1 判定的真实分隔线，如 Vector 分隔线）。
             # 不能把 RECTANGLE 类型都算分隔线——Tab 高亮指示条(如蓝色小横条)虽是 RECTANGLE 但并非分隔线。
             has_divider = any(c.get("component") == "Divider" for c in children)
             field_rows.append((nname, has_divider))
-        
-        # 检测 Tab 导航栏：包含多个 Tab 文字项（如 审批信息/流程跟踪/审批记录）的水平容器
-        tab_keywords = ("审批信息", "流程跟踪", "审批记录", "全部", "待处理", "已处理", "进行中", "已完成")
-        child_texts = [t.get("text", "") for c in children for t in c.get("texts", [])]
-        child_names = [c.get("name", "") for c in children]
-        tab_text_count = sum(any(k in (ct + cn) for k in tab_keywords) for ct, cn in zip(child_texts, child_names))
-        # 仅当节点确实包含 >=2 个 Tab 文字项时才视为导航 Tab 栏，
-        # 避免把系统底部「Tab Bar」指示条误判为导航 Tab。
-        is_tab_bar = tab_text_count >= 2 or (
-            "tab" in nname.lower() and tab_text_count >= 1
-        )
-        if is_tab_bar:
-            # 判断 Tab 栏底部是否有分隔线：在 Tab 栏底边附近（±3px）查找 1px 高度的分隔线
-            tab_bottom = bn.get("top", 0) + bn.get("height", 0)
-            has_bottom_divider = False
-            for c in _iter_nodes(tree):
-                if c is node:
-                    continue
-                if c.get("component") == "Divider" and c.get("borders", 0) > 0:
-                    c_bn = c.get("bounds", {})
-                    if c_bn.get("height", 0) <= 1 and abs(c_bn.get("top", 0) - tab_bottom) <= 3:
-                        has_bottom_divider = True
-                        break
-            if has_bottom_divider:
-                notes.append(f"**Tab 导航**：Tab 栏底部**有分隔线**，与下方内容区区分")
-            else:
-                notes.append(f"**Tab 导航**：Tab 栏底部**没有分隔线**，与下方内容区直接衔接")
 
-        # 检测配套卡片
-        is_peitao_header = (comp_type == "Card" and fills and "#FEF2EC" in fills) or "配套" in nname
-        if is_peitao_header:
-            # 头部背景与圆角（保留 px，不转 rpx）
-            rstr = f"border-radius: [{', '.join(str(int(x)) for x in radius)}]px" if radius else ""
-            bgstr = f"background: {','.join(fills)}" if fills else ""
-            notes.append(
-                f"**配套卡片**：头部 header 背景色为 `{','.join(fills)}`"
-                + (f"，{rstr}" if rstr else "")
-                + "，`overflow: hidden` 裁剪子元素"
-            )
-            # 商品列表背景：在整棵树中查找与头部不同的浅色填充块（即商品列表底色）
-            list_bg = ""
-            for desc in _iter_nodes(tree):
-                if desc is node:
-                    continue
-                df = desc.get("fills", [])
-                if not df or df == fills or df[0] in ("#FFFFFF", "#F2F2F2"):
-                    continue
-                # 只取浅色块作为列表底色候选（亮度足够高，排除文字/深色）
-                hex_str = df[0].lstrip("#")
-                if len(hex_str) == 6:
-                    r, gg, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
-                    brightness = (r * 299 + gg * 587 + b * 114) / 1000
-                    if brightness > 200:
-                        list_bg = df[0]
-                        break
-            if list_bg:
-                notes.append(f"**配套卡片**：下方商品列表背景色为 `{list_bg}`")
-            else:
-                notes.append(f"**配套卡片**：下方商品列表背景色与稿中一致（见列表区块 `bg`）")
-            # 分隔线虚实：根据真实 dash 字段判断
-            dash_style = "虚线" if (node.get("dash") is not None and len(node.get("dash")) > 0) else "实线"
-            notes.append(f"**配套卡片**：商品列表复用普通商品卡片样式，卡片之间用**{dash_style}分隔**（单个商品块本身有 4px 圆角，整体不另加圆角容器）")
-        
         # 检测白色背景的大区块（可能是信息区或商品区）
         if comp_type == "Container" and fills and "#FFFFFF" in fills:
             w = bn.get("width", 0)
             h = bn.get("height", 0)
-            if w >= 343 and h >= 400:
+            root_w = tree.get("bounds", {}).get("width", 0) or 0
+            if root_w and w >= root_w * 0.85 and h >= 200:
                 page_bg = tree.get("fills", ["#F2F2F2"])[0] if tree.get("fills") else "#F2F2F2"
                 notes.append(f"**白色区块**（`{nname or 'Container'}`）：背景色为 `#FFFFFF`，与页面背景 `{page_bg}` 区分")
         
@@ -1157,7 +1270,8 @@ def _generate_impl_notes(tree):
 
     # 统一输出「信息字段行」要点（合并所有字段行的检测结果，避免逐行输出造成歧义）
     if field_rows:
-        with_div = [name for name, d in field_rows if d]
+        # 去重：同名节点可能多次进入 field_rows（如跨两个表格实例）
+        with_div = list(dict.fromkeys(name for name, d in field_rows if d))
         if with_div:
             names = "、".join(f"「{n}」" for n in with_div)
             notes.append(
@@ -1167,19 +1281,31 @@ def _generate_impl_notes(tree):
         else:
             notes.append(f"**信息字段行**：字段行之间**没有分隔线**，不要用 border-bottom")
 
-    # 检测底部菜单栏（根的直接子节点、位于页面底部、含按钮 + Tab 栏）
+    # 检测底部菜单栏：基于结构（位于页面底部 + 含多个按钮形态子节点）识别，
+    # 不依赖类型标记（摹客原始导出无 Navigation 类型）。判断不了就不输出，避免误导。
+    root_h = tree.get("bounds", {}).get("height", 0) or 0
     for child in tree.get("children", []):
-        if "菜单栏" in child.get("name", "") or (
-            child.get("component") == "Container"
-            and any(gc.get("component") == "Navigation" for gc in child.get("children", []))
-            and (child.get("bounds", {}).get("top", 0) + child.get("bounds", {}).get("height", 0))
-            >= tree.get("bounds", {}).get("height", 0) - 5
-        ):
+        cname = child.get("name", "")
+        cb = child.get("bounds", {})
+        at_bottom = root_h and (cb.get("top", 0) + cb.get("height", 0)) >= root_h - 5
+        # 含多个带文字的按钮形态子节点（按钮/普通文字项 >=2 个）
+        btn_like = [c for c in child.get("children", []) if c.get("texts") or c.get("component") == "Button"]
+        if ("菜单栏" in cname) or (at_bottom and len(btn_like) >= 2):
             notes.append(
                 f"**底部菜单栏**：建议**固定吸底**（`position: fixed/sticky`，bottom: 0），"
                 f"层级高于内容区，白色背景遮挡下方滚动内容"
             )
             break
+
+    # 全局默认原则（始终输出，作为实现要点首条）：容器尺寸优先用 padding 撑开，不写死宽高。
+    default_principle = (
+        "**默认原则：容器尺寸优先用 `padding` 撑开，不要写死固定 height/width**。"
+        "文档「页面结构」树中标注 `[内边距]` 的容器，其尺寸由子元素 + 上下/左右 padding 撑开，"
+        "实现时用 `padding` 即可（精确值见树内 [内边距] 标注）。仅两种例外才写死："
+        "① 脚本对该容器尺寸/内容识别不稳定、实现时可能崩溃或报错；② 用户明确要求固定值。"
+        "（表格等设计稿定宽节点的宽度已内联在节点 bounds 上，照写即可，无需自适应。）"
+    )
+    notes.insert(0, default_principle)
 
     # 添加通用要点
     if not notes:
@@ -1225,10 +1351,14 @@ def _analyze_reusable_components(tree):
             def _child_sig(c, depth=0):
                 c_type = c.get("component", c.get("type", ""))
                 c_texts = [t.get("text", "") for t in c.get("texts", [])]
-                if not c_texts and c_type in ("Container", "Card"):
-                    # 纯布局容器（无文字内容）：递归展开其内部结构，避免「Container(布局)」空壳，
-                    # 否则复用组件描述会丢失深层真实字段（如商品卡内的名称/数量/单价）
-                    if depth < 3:
+                # 无文字但含子节点时，递归穿透到真实 TEXT 叶子取文字，避免签名退化成
+                # 纯类型串（如 Form Row/List Item 包文字却无自身 texts，会被误判成
+                # 同构而折叠——表格表头行就因此被吞掉）。仅对容器型节点递归，TEXT 等
+                # 叶子节点无 children，自然落到下面的文字分支。
+                container_types = ("Container", "Card", "Form Row", "List Item",
+                                   "Text Block", "List Container", "Navigation")
+                if not c_texts and c_type in container_types and c.get("children"):
+                    if depth < 4:
                         sub = [_child_sig(sc, depth + 1) for sc in c.get("children", [])]
                         if sub:
                             return f"{c_type}(布局): " + " / ".join(sub)
