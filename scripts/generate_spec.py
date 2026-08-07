@@ -10,26 +10,6 @@
 """
 
 import json, argparse, sys, os
-from collections import Counter
-
-COMP_TYPE_ALIASES = {
-    "卡片": "Card",
-    "按钮": "Button",
-    "导航": "Navigation",
-    "导航栏": "Navigation",
-    "列表项": "List Item",
-    "输入框": "Input Field",
-    "表单项": "Form Row",
-    "弹窗": "Modal",
-    "模态框": "Modal",
-    "容器": "Container",
-    "标题": "Heading",
-    "图标": "Icon",
-    "头像": "Avatar",
-    "分割线": "Divider",
-    "分隔线": "Divider",
-    "圆角矩形": "Rounded Box",
-}
 
 
 def to_hex(rgb):
@@ -162,8 +142,11 @@ def get_text_info(node):
 
 
 def get_opacity(node):
-    # 摹客 JSON 透明度在 basic.opacity，不在顶层
-    return node.get("basic", {}).get("opacity", 1)
+    # 摹客 JSON 透明度在 basic.opacity，不在顶层；缺字段/非数值时回退 1（不透明）
+    try:
+        return float(node.get("basic", {}).get("opacity", 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def get_autolayout(node):
@@ -423,9 +406,17 @@ def infer_component_type(node, context=""):
 
 # ---- 布局分析 ----
 
-def detect_layout(children):
+def detect_layout(children, node=None):
     blist = [get_bounds(c) for c in children if get_bounds(c)]
     if len(blist) < 2:
+        # 子节点不足（如 TEXT 被内联为文字行、仅 1 个内容子节点）无法靠坐标判方向，
+        # 回退用摹客 autoLayout 权威 layoutMode（HORIZONTAL/VERTICAL）。
+        al = get_autolayout(node) if node is not None else None
+        mode = (al or {}).get("layout_mode", "")
+        if mode == "HORIZONTAL":
+            return {"type": "horizontal", "direction": "→"}
+        if mode == "VERTICAL":
+            return {"type": "vertical", "direction": "↓"}
         return {"type": "single", "direction": ""}
     
     tops = [b["top"] for b in blist]
@@ -567,21 +558,6 @@ def _infer_padding(node):
 
 # ---- 树结构 ----
 
-def has_content(node):
-    texts = get_text_info(node)
-    if texts:
-        return True
-    fills = get_fill_colors(node)
-    if fills:
-        return True
-    if get_radius(node) or get_border_count(node):
-        return True
-    for child in node.get("children", []):
-        if has_content(child):
-            return True
-    return False
-
-
 def build_tree(node, depth=0):
     ntype = get_type(node)
     nname = get_name(node)
@@ -671,16 +647,29 @@ def build_tree(node, depth=0):
             for t in c.get("texts", []):
                 if t.get("color"):
                     tcolors.append(t["color"])
+        # 纯文本容器的子节点已内联为文字行，children 置空；但设计稿若声明了 autoLayout
+        # 方向（VERTICAL/HORIZONTAL），应据实输出布局方向，避免纵向排布的多个文本丢失
+        # 「vertical ↓」标记。autoLayout 不存在时（layout_mode 缺失）不臆造方向。
+        al = get_autolayout(node)
+        mode = (al or {}).get("layout_mode", "")
+        if mode == "HORIZONTAL":
+            layout = {"type": "horizontal", "direction": "→"}
+        elif mode == "VERTICAL":
+            layout = {"type": "vertical", "direction": "↓"}
+        else:
+            layout = {"type": "single", "direction": ""}
         return {
             "type": ntype, "name": nname, "bounds": bn,
             "fills": fills, "radius": radius, "borders": borders,
+            "border_info": get_border_info(node),
             "dash": get_dash(node),
             "opacity": opacity, "blur": blur,
             "texts": texts, "children": [], "component": comp_type,
-            "autolayout": get_autolayout(node),
+            "layout": layout,
+            "autolayout": al,
         }
 
-    layout_info = detect_layout(children)
+    layout_info = detect_layout(children, node)
 
     return {
         "type": ntype, "name": nname, "bounds": bn,
@@ -740,88 +729,6 @@ def _signature(node):
         parts.append(f"r{r}")
     parts.append(f"c{len(node.get('children', []))}")
     return tuple(parts) if len(parts) > 2 else None
-
-
-# ---- 样式汇总 ----
-
-def collect_font_styles(node, counter):
-    for s in node.get("text", {}).get("styles", []):
-        font = s.get("font", {})
-        size = font.get("size") or font.get("fontSize")
-        weight = font.get("fontWeight") or font.get("weight")
-        color_val = font.get("color", {}).get("value", {})
-        if size:
-            color_hex = to_hex(color_val) if color_val else ""
-            key = f"{size}px/{weight or 'normal'}/{color_hex}"
-            counter[key] += 1
-    for child in node.get("children", []):
-        collect_font_styles(child, counter)
-
-
-def collect_spacing_patterns(node, patterns):
-    children = node.get("children", [])
-    if len(children) < 2:
-        return
-    
-    layout_info = detect_layout(children)
-    if layout_info["type"] == "vertical" and layout_info["vertical_gaps"]:
-        for gap in layout_info["vertical_gaps"]:
-            patterns["vertical"].append(round(gap, 1))
-    elif layout_info["type"] == "horizontal" and layout_info["horizontal_gaps"]:
-        for gap in layout_info["horizontal_gaps"]:
-            patterns["horizontal"].append(round(gap, 1))
-    
-    for child in children:
-        collect_spacing_patterns(child, patterns)
-
-
-# ---- 开发任务生成 ----
-
-def _comp_type_matches(kw, comp_type):
-    kw_lower = kw.lower()
-    comp_lower = comp_type.lower()
-    if kw_lower in comp_lower:
-        return True
-    for alias, eng in COMP_TYPE_ALIASES.items():
-        if kw_lower in alias.lower() and eng.lower() == comp_lower:
-            return True
-    return False
-
-def generate_development_tasks(tree):
-    tasks = []
-    
-    def traverse(node, parent_path="", depth=0):
-        comp_type = node.get("component", "")
-        nname = node.get("name", "")
-        bounds = node.get("bounds", {})
-        fills = node.get("fills", [])
-        radius = node.get("radius", [])
-        texts = node.get("texts", [])
-        
-        path = f"{parent_path} > {nname}" if parent_path else nname
-        
-        if comp_type in ("Button", "Card", "List Item", "Input Field", "Navigation", "Modal", "Container", "Form Row"):
-            task = {
-                "component": comp_type,
-                "name": nname,
-                "path": path,
-                "size": f"{bounds['width']:.0f}×{bounds['height']:.0f}px",
-                "style": [],
-                "text_count": len(texts),
-                "children_count": len(node.get("children", [])),
-                "priority": "high" if depth <= 2 else "medium",
-            }
-            if fills:
-                task["style"].append(f"background: {','.join(fills)}")
-            if radius:
-                task["style"].append(f"border-radius: {radius}")
-            tasks.append(task)
-        
-        for child in node.get("children", []):
-            traverse(child, path, depth + 1)
-    
-    traverse(tree)
-    return tasks
 
 
 # ---- 文档生成 ----
@@ -899,7 +806,7 @@ def generate(root, design_width=375):
             for note in unique_notes:
                 lines.append(f"- {note}")
 
-    lines.append(f"\n---\n*由 design-analyzer 自动生成*")
+    lines.append("\n---\n*由 design-analyzer 自动生成*")
     return "\n".join(lines)
 
 
@@ -1042,8 +949,18 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
             # 间距列表与子节点树同级缩进（用 child_prefix），保持树形视觉连续。
             # 页面根节点下的区块间距（卡片间距/section 间距）对实现同样关键，不再跳过。
             lines.append(f"{child_prefix}- 子元素间距:")
-            for a, bn, g in gaps[:10]:
+            for a, b_name, g in gaps[:10]:
                 lines.append(f"{child_prefix}  - {a} → {bn}: {g}px ({px2rpx(g)}rpx)")
+
+    # 纯文本容器（children 已内联为文字行）：子元素间距来自 autoLayout 的 itemSpacing，
+    # 因 raw_children 为空、坐标法失效，改用 autoLayout 权威值直接输出，避免纵向排布的
+    # 多个文本丢失间距信息。autoLayout 缺失或间距为 0 时不输出，避免臆造。
+    if not raw_children and node.get("texts"):
+        al = get_autolayout(node)
+        isp = (al or {}).get("item_spacing", 0) or 0
+        if isp > 0:
+            lines.append(f"{child_prefix}- 子元素间距:")
+            lines.append(f"{child_prefix}  - 文字行间距: {isp}px ({px2rpx(isp)}rpx)")
 
     # 内边距推断：仅当某方向差值较小（内边距而非大留白）时注解。
     # 纯图标容器的"留白"是图标视觉内边距，非布局 padding，跳过。
@@ -1075,83 +992,6 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
                 prefix=child_prefix, is_last=(idx == len(sorted_children) - 1))
 
 
-def _collect_colors(node, cc):
-    for c in node.get("fill", {}).get("colors", []):
-        v = c.get("value", {})
-        r, g, b = v.get("r", 0), v.get("g", 0), v.get("b", 0)
-        if not (r > 248 and g > 248 and b > 248):
-            cc[to_hex(v)] += 1
-    for s in node.get("text", {}).get("styles", []):
-        color_val = s.get("font", {}).get("color", {}).get("value", {})
-        if color_val:
-            r, g, b = color_val.get("r", 0), color_val.get("g", 0), color_val.get("b", 0)
-            if not (r > 248 and g > 248 and b > 248):
-                cc[to_hex(color_val)] += 1
-    for child in node.get("children", []):
-        _collect_colors(child, cc)
-
-
-def _collect_all_texts(node):
-    result = []
-    for t in node.get("texts", []):
-        result.append(t)
-    for child in node.get("children", []):
-        result.extend(_collect_all_texts(child))
-    return result
-
-
-def _collect_components(node, components):
-    comp_type = node.get("component", "")
-    if comp_type in ("Button", "Card", "List Item", "Input Field", "Navigation", "Modal"):
-        bn = node.get("bounds", {})
-        components.append({
-            "component": comp_type,
-            "name": node.get("name", ""),
-            "size": f"{bn['width']:.0f}×{bn['height']:.0f}px",
-        })
-    for child in node.get("children", []):
-        _collect_components(child, components)
-
-
-def _collect_all_icons(node, parent_name="", icons=None):
-    """收集所有图标信息，包括名称、尺寸、颜色、使用位置。"""
-    if icons is None:
-        icons = []
-    icon_name = node.get("icon_name", "")
-    if icon_name:
-        fills = node.get("fills", [])
-        borders = node.get("borders", 0)
-        # 对于 Frame 容器图标，收集子节点的颜色
-        color = fills[0] if fills else ""
-        if not color and node.get("children"):
-            child_colors = set()
-            for c in node.get("children", []):
-                cf = c.get("fills", [])
-                if cf:
-                    child_colors.add(cf[0])
-            if len(child_colors) == 1:
-                color = child_colors.pop()
-            elif child_colors:
-                color = ",".join(sorted(child_colors))
-        if not color and borders:
-            color = "stroke"
-        if not color:
-            color = "—"
-        bn = node.get("bounds", {})
-        size = f"{bn.get('width', 0):.0f}×{bn.get('height', 0):.0f}"
-        location = parent_name if parent_name else node.get("name", "")
-        icons.append({
-            "name": icon_name,
-            "size": size,
-            "color": color,
-            "location": location,
-        })
-    for child in node.get("children", []):
-        child_name = node.get("name", "")
-        _collect_all_icons(child, child_name, icons)
-    return icons
-
-
 def _generate_impl_notes(tree):
     """生成实现要点，帮助开发者快速准确地实现设计稿。"""
     notes = []
@@ -1159,11 +999,6 @@ def _generate_impl_notes(tree):
     # 供 analyze 结束后合并成一条精确的「信息字段行」要点，避免逐行输出造成歧义。
     field_rows = []
 
-    def _iter_nodes(n):
-        yield n
-        for c in n.get("children", []):
-            yield from _iter_nodes(c)
-    
     def analyze(node, depth=0, siblings_after=None):
         comp_type = node.get("component", "")
         nname = node.get("name", "")
