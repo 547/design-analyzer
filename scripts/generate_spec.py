@@ -944,7 +944,8 @@ def _infer_semantic(node):
             return "推测：底部操作栏"
 
     # 5. 卡片语义：白色/浅色背景 + 圆角 + 较大内容容器（高度>80 且含多个子结构）
-    #    取子树首个较长「标题文本」作为卡片业务名。小按钮/小标签不误判为卡片。
+    #    业务名取**卡片直接子文本**中字号最大者（标题在卡片直接层级，而非深层表格数据/按钮文字）；
+    #    若直接子层无合适标题文本，说明无法可靠判定业务名，遵循「判断不了就不输出」，不臆测。
     fills = node.get("fills", [])
     radius = node.get("radius", [])
     if (not fills or fills[0].upper() in ("#FFFFFF", "#F7F8FA", "#FAFAFA", "#F6F6F6")) and radius:
@@ -952,11 +953,17 @@ def _infer_semantic(node):
             has_form = any(c.get("component") in ("Form Row", "Text Block", "Container", "Card")
                            for c in children)
             if has_form:
+                # 直接子文本（node 自身的 texts，非子树递归），按字号降序选标题候选
+                direct = node.get("texts", [])
                 title_candidate = ""
-                for t in all_txt:
-                    if len(t) >= 2 and t not in ("on", "off") and not t.isdigit():
-                        title_candidate = t
-                        break
+                best_fs = -1
+                for t in direct:
+                    txt = t.get("text", "")
+                    if len(txt) >= 2 and txt not in ("on", "off") and not txt.isdigit():
+                        fs = t.get("fontSize") or 0
+                        if fs > best_fs:
+                            best_fs = fs
+                            title_candidate = txt
                 if title_candidate:
                     return f"卡片（{title_candidate}）"
 
