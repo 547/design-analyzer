@@ -185,62 +185,6 @@ def get_blur(node):
     return node.get("blur", {}).get("radius", 0)
 
 
-# ---- 交互说明 / 标注线识别 ----
-#
-# 摹客设计稿里，设计师常把「给开发的批注」当作普通图层放在画布上：
-#   - 说明文字：如「多个标签宽度超出，可以左右滑动」「适用销司超过三个显示查看更多」
-#     这类是交互行为描述，不是要实现的 UI 元素；
-#   - 标注引线：名为 Arrow N 的 1px 高 VECTOR，是连接批注与元素的指示线。
-# 这些节点若混进结构树，AI 会误当成 UI 实现，还会污染间距/字段行分析。
-# 故识别后打 annotation 标记：不进「页面结构」树，单独抽成「交互行为」节。
-
-ANNOTATION_KEYWORDS = (
-    "可以左右滑动", "超出，可以", "超过三个", "显示『查看更多』", "弹窗显示全部",
-    "可左右滑动", "横向滑动", "可滑动",
-)
-
-
-def _is_annotation_text(node):
-    if node.get("type") != "TEXT":
-        return False
-    # 保守约束：带背景填充或边框的文字节点视为真实 UI 元素（如「查看全部」按钮），
-    # 不当批注剔除——避免静默漏做真实按钮。仅裸文字（无 fills/borders）才可能是批注。
-    if node.get("fills") or node.get("borders"):
-        return False
-    txt = " ".join(t.get("text", "") for t in node.get("texts", []))
-    return any(k in txt for k in ANNOTATION_KEYWORDS)
-
-
-def _is_annotation_line(node):
-    """标注引线：名为 Arrow N 的极细线（高度 ≤ 2px）。"""
-    nname = node.get("name", "")
-    if not nname.startswith("Arrow"):
-        return False
-    bn = node.get("bounds", {})
-    return bn.get("height", 0) <= 2
-
-
-def _is_annotation(node):
-    return _is_annotation_text(node) or _is_annotation_line(node)
-
-
-def _mark_annotations(node):
-    """递归给交互说明/标注线节点打 annotation 标记（build_tree 之后调用）。"""
-    if _is_annotation(node):
-        node["annotation"] = True
-    for c in node.get("children", []):
-        _mark_annotations(c)
-
-
-def _collect_annotations(node, out):
-    """收集所有 annotation 节点（用于独立「交互行为」节）。"""
-    if node.get("annotation"):
-        out.append(node)
-    for c in node.get("children", []):
-        _collect_annotations(c, out)
-
-
-
 
 # ---- 扁平列表 → 嵌套树 ----
 
@@ -568,7 +512,6 @@ def build_tree(node, depth=0):
     if ntype == "TEXT":
         ti = get_text_info(node)
         if ti:
-            # 带 fills/borders，供 _is_annotation_text 判断「带底色的文字不当批注」（避免吞真实按钮）
             return {"type": ntype, "name": nname, "bounds": bn, "texts": ti, "children": [],
                     "component": comp_type, "fills": get_fill_colors(node), "borders": get_border_count(node)}
         return None
@@ -740,9 +683,6 @@ def generate(root, design_width=375):
                 "fills": get_fill_colors(root), "texts": [], "children": [], "component": "Container"}
     tree["_root_height"] = get_bounds(root).get("height", 0)
 
-    # 标记交互说明/标注线节点（不进结构树，单独抽成「交互行为」节）
-    _mark_annotations(tree)
-
     lines = []
     lines.append("# 设计规格文档\n")
     bn = get_bounds(root)
@@ -777,19 +717,6 @@ def generate(root, design_width=375):
 
     lines.append("\n---\n## 页面结构")
     _render(tree, lines, 0, path=tree.get("name", ""), reusable_ref=reusable_ref)
-
-    # 交互行为（设计师批注/标注线，非要实现 UI 元素，单独成节避免误导实现）
-    annotations = []
-    _collect_annotations(tree, annotations)
-    if annotations:
-        lines.append("\n---\n## 交互行为")
-        lines.append("> 以下为设计稿中的交互说明/标注线（设计师批注），**不是要实现的 UI 节点**，仅供理解交互逻辑。")
-        for a in annotations:
-            if a.get("type") == "TEXT":
-                txt = " ".join(t.get("text", "") for t in a.get("texts", []))
-                lines.append(f"- {txt}")
-            else:
-                lines.append(f"- 标注线 `{a.get('name', '')}`（连接批注与元素，无需实现）")
 
     # 实现要点（跨节点/行为级约束，页面结构树无法体现的全局提示，开发照稿实现必需）
     impl_notes = _generate_impl_notes(tree)
@@ -903,7 +830,7 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         extra = " ".join(filter(None, [fs, fw, lh, align_str]))
         lines.append(f"{anno_prefix}- `{t['text']}`  {extra}  {fc}")
 
-    raw_children = [c for c in node.get("children", []) if not c.get("annotation")]
+    raw_children = [c for c in node.get("children", [])]
 
     # 过滤纯空节点：摹客共享样式/变体组件的子节点有时未随实例还原（build_tree 后
     # children 为空），这类节点无子、无文字、无样式，对实现零价值，渲染成空格子反而误导开发。
