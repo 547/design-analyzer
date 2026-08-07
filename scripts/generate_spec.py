@@ -925,7 +925,7 @@ def _generate_impl_notes(tree):
     # 供 analyze 结束后合并成一条精确的「信息字段行」要点，避免逐行输出造成歧义。
     field_rows = []
 
-    def analyze(node, depth=0, siblings_after=None):
+    def analyze(node, depth=0):
         comp_type = node.get("component", "")
         nname = node.get("name", "")
         fills = node.get("fills", [])
@@ -960,8 +960,7 @@ def _generate_impl_notes(tree):
                     notes.append(f"**分隔线**：`{child.get('name', 'Vector')}` 是 1px 高度的分隔线，注意与 1px 间距区分")
         
         for idx, child in enumerate(children):
-            rest = children[idx + 1:]
-            analyze(child, depth + 1, siblings_after=rest)
+            analyze(child, depth + 1)
     
     analyze(tree)
 
