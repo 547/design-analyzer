@@ -1170,8 +1170,9 @@ def _analyze_reusable_components(tree):
 def main():
     p = argparse.ArgumentParser(description="生成设计规格文档")
     p.add_argument("file", help="摹客 JSON 文件路径")
-    p.add_argument("-o", "--output", help="输出文件路径（默认输出到运行命令所在目录下的 design-analyzer/spec_页面名.md）")
+    p.add_argument("-o", "--output", help="输出文件路径（默认按输入 JSON 文件名生成，避免同页多稿互相覆盖）")
     p.add_argument("-w", "--width", type=int, default=375, help="设计图宽度（默认 375px）")
+    p.add_argument("-n", "--name", help="自定义输出文件名（不含扩展名，自动补 .md 并落到 design-analyzer/ 目录）；不指定则默认用输入 JSON 文件名")
     args = p.parse_args()
 
     with open(args.file) as f:
@@ -1180,15 +1181,26 @@ def main():
     # 摹客 JSON 是扁平列表，需要转换为嵌套树
     root = build_tree_from_flat_list(flat_nodes)
 
-    page_name = root.get("basic", {}).get("name", "design")
     if args.output:
+        # -o 指定完整输出路径（最高优先级，保持原有行为）
         out_file = args.output
     else:
         # 默认输出到「用户当前工作目录」下的 design-analyzer/ 子目录，自动创建。
         # 注意：这里是用户运行命令时所在的目录（即项目目录），而非脚本/skill 所在目录。
         out_dir = os.path.join(os.getcwd(), "design-analyzer")
         os.makedirs(out_dir, exist_ok=True)
-        out_file = os.path.join(out_dir, f"spec_{page_name}.md")
+        # 输出文件名规则（优先级从高到低）：
+        #   1. -n/--name 自定义
+        #   2. 默认用「输入 JSON 文件名（去 .json）」
+        # 默认不用 JSON 内部的 root.name 做文件名：同一页面在不同状态下会有多张设计稿
+        # （如「指定销司」「指定门店」「暂无样机标准数据」），它们的 root.name 往往相同
+        # （如都是「审批详情-样机标准申请」），用 root.name 会互相静默覆盖、丢失有用稿；
+        # 而 JSON 文件名本身已带状态区分，与其一一对应，天然不重名，用户手工归档也多用此命名。
+        if args.name:
+            base = args.name
+        else:
+            base = os.path.splitext(os.path.basename(args.file))[0]
+        out_file = os.path.join(out_dir, f"{base}.md")
 
     md = generate(root, args.width)
 
