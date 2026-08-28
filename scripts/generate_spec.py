@@ -185,6 +185,20 @@ def get_blur(node):
     return node.get("blur", {}).get("radius", 0)
 
 
+def get_slice_image(node):
+    """返回图片切图信息：摹客导出的 INSTANCE/symbol/BITMAP 组件带 slice 字段，
+    含 bitmapURL（位图）与 svgURL（矢量切图）。无图片则返回 None，否则返回
+    dict：{'bitmap': url, 'svg': url}（缺哪项则对应值为空字符串）。"""
+    sl = node.get("slice") or {}
+    if not isinstance(sl, dict):
+        return None
+    bmp = sl.get("bitmapURL", "") or ""
+    svg = sl.get("svgURL", "") or ""
+    if not bmp and not svg:
+        return None
+    return {"bitmap": bmp, "svg": svg}
+
+
 
 # ---- 扁平列表 → 嵌套树 ----
 
@@ -286,6 +300,13 @@ def infer_component_type(node):
         if "提示" in nname or "hint" in name_lower:
             return "Hint Text"
         return "Text"
+
+    if ntype in ("INSTANCE", "BITMAP", "symbol"):
+        # 摹客导出的图片/图标组件（如空状态插图 undraw_no_data）以 INSTANCE(或
+        # symbol/BITMAP) + slice.bitmapURL 形式出现，带切图 URL 即视为图片图标。
+        if get_slice_image(node):
+            return "Image/Icon"
+        return "Component"
 
     if ntype == "RECTANGLE":
         if radius:
@@ -519,7 +540,8 @@ def build_tree(node, depth=0):
         fills = get_fill_colors(node)
         radius = get_radius(node)
         borders = get_border_count(node)
-        if fills or radius or borders:
+        slice_img = get_slice_image(node)
+        if fills or radius or borders or slice_img:
             # 提取图标名称（从节点名中推断）
             icon_name = ""
             if ntype in ("VECTOR", "BITMAP"):
@@ -529,7 +551,11 @@ def build_tree(node, depth=0):
                 if bw <= 44 and bh <= 44 and len(fills) <= 1 and borders <= 1:
                     # 保留原始名称（如 "Cap", "路径 2" 等），方便对应切图文件
                     icon_name = nname
-            
+            elif slice_img:
+                # 带切图 URL 的 INSTANCE/symbol/BITMAP 组件（如空状态插图），
+                # 无论尺寸都把名称保留为图标名，方便对照切图文件实现占位图。
+                icon_name = nname
+
             return {
                 "type": ntype, "name": nname, "bounds": bn,
                 "fills": fills, "radius": radius, "borders": borders,
@@ -537,6 +563,7 @@ def build_tree(node, depth=0):
                 "dash": get_dash(node),
                 "texts": [], "children": [], "component": comp_type,
                 "icon_name": icon_name,
+                "slice_img": slice_img,
             }
         return None
 
@@ -799,7 +826,12 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     # 输出图标名称（如果有）
     icon_name = node.get("icon_name", "")
     if icon_name:
-        lines.append(f"{anno_prefix}- [图标: {icon_name}]")
+        slice_img = node.get("slice_img")
+        if slice_img:
+            url = slice_img.get("bitmap") or slice_img.get("svg")
+            lines.append(f"{anno_prefix}- [图标: {icon_name}] 图片切图: {url}")
+        else:
+            lines.append(f"{anno_prefix}- [图标: {icon_name}]")
 
     for t in node.get("texts", []):
         fs = f"fs={t['fontSize']}" if t.get("fontSize") else ""
@@ -839,6 +871,7 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
             and not c.get("fills") and not c.get("borders")
             and not c.get("radius") and c.get("opacity", 1) >= 1
             and not c.get("blur") and not c.get("icon_name")
+            and not c.get("slice_img")
         )
     raw_children = [c for c in raw_children if not _is_empty_node(c)]
     # 排序规则（按布局方向），间距计算与渲染共用，保证顺序一致
