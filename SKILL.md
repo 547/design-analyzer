@@ -28,12 +28,14 @@ python3 scripts/generate_spec.py design.json
 ```
 
 **可选参数**：
-- `-o, --output <路径>`：自定义输出文件路径（默认输出到**你运行命令时所在目录（项目目录）**下的 `design-analyzer/spec_页面名.md`，目录不存在会自动创建。例如你在 `flutter-pin-module/` 中运行脚本，文档就生成到 `flutter-pin-module/design-analyzer/`，**不会**放到 skill 自身目录）
+- `-o, --output <路径>`：自定义输出文件路径（最高优先级，直接作为最终路径）
+- `-n, --name <文件名>`：自定义输出文件名（不含扩展名，自动补 `.md` 并落到 `design-analyzer/` 目录）
+- 两者都不指定时，**默认用输入 JSON 的文件名（去 `.json`）**作为输出名，生成到**你运行命令时所在目录（项目目录）**下的 `design-analyzer/`。例如 `design.json` → `design-analyzer/design.md`。**同一页面不同状态的多张设计稿，其 JSON 文件名本就带状态区分（如 `-指定销司`、`-暂无样机标准数据`），默认命名天然不重名、互不覆盖**。目录不存在会自动创建；你在 `flutter-pin-module/` 中运行脚本，文档就生成到 `flutter-pin-module/design-analyzer/`，**不会**放到 skill 自身目录。
 - `-w, --width <数字>`：设计图基准宽度（默认 375，用于 rpx 换算参考）
 
 ### 步骤 3：阅读生成的规格文档
 
-脚本输出 `spec_页面名.md`，默认核心为两节（去除可从结构树推导的冗余统计，省 token）：
+脚本输出文档（默认命名见上），默认核心为两节（去除可从结构树推导的冗余统计，省 token）：
 
 1. **页面结构**（树形） → 理解页面层级与每个节点的精确样式（色值/圆角/字号已内联在节点行）
 2. **实现要点** → **必读**，关键实现细节（分隔线、吸底、裁剪等跨节点约束）
@@ -123,7 +125,11 @@ python3 scripts/generate_spec.py design.json
 ```markdown
   - [图标: 图标名称]
 ```
-对应切图文件夹中的图片文件（SVG/PNG/JPG/WebP，按图标名称查找）。
+矢量/位图图标（小尺寸 Vector/Bitmap、或 INSTANCE/symbol 带切图的图片组件，如空状态插图）会标为图标节点。若节点带切图资源，额外输出图片 URL：
+```markdown
+  - [图标: empty_order] 图片切图: /s3/idoc/figma/.../xxx.png
+```
+对应切图文件夹中的图片文件（SVG/PNG/JPG/WebP，按图标名称查找）；INSTANCE 类图片组件可直接用给出的切图 URL 取图。
 
 **子元素间距**：
 ```markdown

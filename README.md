@@ -14,7 +14,7 @@
 
 ## 输出在哪
 
-规格文档默认生成在**当前项目目录**下的 `design-analyzer/spec_页面名.md`（目录不存在会自动创建）。例如你在 `my-app/` 中触发 skill，文档就落在 `my-app/design-analyzer/`，不会放到 skill 自身目录。
+规格文档默认生成在**当前项目目录**下的 `design-analyzer/`，文件名默认取**输入 JSON 的文件名（去 `.json`）**，例如 `design.json` → `my-app/design-analyzer/design.md`（目录不存在会自动创建）。同一页面不同状态的多张设计稿 JSON 文件名通常已带状态区分，默认命名互不覆盖。也可通过 `-n 文件名` 自定义、或 `-o 完整路径` 指定。你在 `my-app/` 中触发 skill，文档就落在 `my-app/design-analyzer/`，不会放到 skill 自身目录。
 
 ## 只做部分 UI
 
