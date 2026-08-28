@@ -199,6 +199,15 @@ def get_slice_image(node):
     return {"bitmap": bmp, "svg": svg}
 
 
+def _is_image_component(node):
+    """判断节点是否为「图片/图标组件」：INSTANCE/symbol/BITMAP 类型且带切图 URL。
+
+    与 infer_component_type、build_tree 共用同一判定来源（get_slice_image），
+    避免两处口径分歧导致 component 类型与渲染出的切图链接不一致。
+    """
+    return get_slice_image(node) is not None
+
+
 
 # ---- 扁平列表 → 嵌套树 ----
 
@@ -304,7 +313,7 @@ def infer_component_type(node):
     if ntype in ("INSTANCE", "BITMAP", "symbol"):
         # 摹客导出的图片/图标组件（如空状态插图 undraw_no_data）以 INSTANCE(或
         # symbol/BITMAP) + slice.bitmapURL 形式出现，带切图 URL 即视为图片图标。
-        if get_slice_image(node):
+        if _is_image_component(node):
             return "Image/Icon"
         return "Component"
 
@@ -456,7 +465,11 @@ def _is_icon_container(node):
     if bn.get("width", 0) > 24 or bn.get("height", 0) > 24:
         return False
     children = node.get("children", [])
-    return any(c.get("component") == "Icon" or c.get("type") in ("VECTOR", "BITMAP")
+    # 子节点为图标（小尺寸 Vector/Bitmap 推断的 Icon，或 INSTANCE/symbol 带切图的
+    # Image/Icon 图片组件）即视为图标容器，避免把含图片切图子节点的容器误判成
+    # 需推断内边距的布局容器（其「留白」是图标视觉内边距，非布局 padding）。
+    return any(c.get("component") in ("Icon", "Image/Icon")
+               or c.get("type") in ("VECTOR", "BITMAP")
                for c in children)
 
 
@@ -696,6 +709,12 @@ def _signature(node):
     r = node.get("radius", [])
     if r:
         parts.append(f"r{r}")
+    # 切图 URL 纳入签名：多个同名、同尺寸、同类型的空状态插图（如不同页的
+    # undraw 占位图）若仅按名称/尺寸判定会被 merge_repeats 误合并成 ×N 而丢失其一；
+    # 切图 URL 不同则签名不同、各自保留，同一切图的真正重复实例仍可正常合并。
+    sl = node.get("slice_img") or {}
+    if sl.get("bitmap") or sl.get("svg"):
+        parts.append(f"img:{sl.get('bitmap') or sl.get('svg')}")
     parts.append(f"c{len(node.get('children', []))}")
     return tuple(parts) if len(parts) > 2 else None
 
@@ -1183,6 +1202,10 @@ def main():
 
     if args.output:
         # -o 指定完整输出路径（最高优先级，保持原有行为）
+        if args.name:
+            # -o 与 -n 同时传入时 -o 优先，-n 被忽略，提示避免困惑
+            print("⚠️  同时指定了 -o/--output 与 -n/--name，以 -o 为准，-n 已忽略",
+                  file=sys.stderr)
         out_file = args.output
     else:
         # 默认输出到「用户当前工作目录」下的 design-analyzer/ 子目录，自动创建。
