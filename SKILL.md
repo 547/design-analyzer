@@ -180,6 +180,7 @@ python3 scripts/generate_spec.py design.json
 | Radio | 单选框 |
 | List Container | 列表容器 |
 | Icon | 图标（小尺寸 Vector/Bitmap） |
+| Image/Icon | 带切图的 INSTANCE/symbol/BITMAP 图片组件（如空状态插图） |
 | Avatar | 头像 |
 | Divider | 分隔线 |
 | Container | 容器（默认类型） |

@@ -20,7 +20,7 @@
 
 不需要整页实现时，直接跟 agent 说按规格文档做局部即可，例如：
 
-- "根据 `spec_xxx.md` 实现其中的搜索栏"
-- "参考 `spec_xxx.md` 修改首页的卡片列表样式"
+- "根据 `design-analyzer/design.md` 实现其中的搜索栏"
+- "参考 `design-analyzer/xxx.md` 修改首页的卡片列表样式"
 
 agent 会读取对应规格文档，只处理你指定的那部分 UI。
