@@ -32,6 +32,77 @@ def to_hex(rgb):
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def _parse_color(s):
+    """把 `#RRGGBB` / `#RRGGBBAA` / `rgba(r,g,b,a)` / `rgb(r,g,b)` 解析成 (r,g,b,a)。"""
+    s = (s or "").strip()
+    if s.startswith("#"):
+        h = s[1:]
+        if len(h) == 8:
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), int(h[6:8], 16) / 255)
+        if len(h) == 6:
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 1.0)
+        return (0, 0, 0, 1)
+    if s.startswith("rgba"):
+        nums = s[s.find("(") + 1:s.find(")")].split(",")
+        return (int(nums[0]), int(nums[1]), int(nums[2]), float(nums[3]) if len(nums) > 3 else 1)
+    if s.startswith("rgb"):
+        nums = s[s.find("(") + 1:s.find(")")].split(",")
+        return (int(nums[0]), int(nums[1]), int(nums[2]), 1)
+    return (0, 0, 0, 1)
+
+
+def _composite_layers(layers):
+    """把多层填充（底→顶）alpha 合成为最终 hex。
+
+    摹客常把「实底色 + 白色半透明叠加」作为样式导出（如 #F03C3C + 白0.9）。
+    开发直接 Copy 任一层都会用错（本次背景过深即源于此）。这里机械合成出
+    最终可见色并返回，文档只输出这一个值，不列出原始分层。单层原样返回。
+    """
+    if not layers:
+        return ""
+    if len(layers) == 1:
+        return layers[0]
+    cur = _parse_color(layers[0])
+    for nxt in layers[1:]:
+        fg = _parse_color(nxt)
+        a = fg[3]
+        if a >= 1:
+            cur = fg
+        else:
+            cur = (
+                fg[0] * a + cur[0] * (1 - a),
+                fg[1] * a + cur[1] * (1 - a),
+                fg[2] * a + cur[2] * (1 - a),
+                1,
+            )
+    return "#%02X%02X%02X" % (round(cur[0]), round(cur[1]), round(cur[2]))
+
+
+def get_color(node, kind="fill"):
+    """统一获取节点的「最终可见颜色」——脚本中所有取色都应走这里。
+
+    kind='fill'：取填充色并底→顶 alpha 合成为最终 hex。兼容两种节点形态：
+      原始 JSON 节点（node.fill.colors）与已构建的树节点（node.fills 为颜色字符串列表）。
+      多层叠加时自动合成（如红底 + 白0.9），单图层原样返回；无填充返回 ''。
+      背景色与文字色都走此路径。
+    kind='border'：取描边颜色（边框通常为单色，不做合成），返回「Wpx #COLOR」列表；无边框返回 []。
+      兼容树节点（node.border_info）与原始节点。
+    """
+    if kind == "fill":
+        colors = node.get("fills")
+        if not colors:
+            raw = node.get("fill")
+            if raw and raw.get("colors"):
+                colors = get_fill_colors(node)
+        return _composite_layers(colors or [])
+    if kind == "border":
+        bi = node.get("border_info")
+        if bi is not None:
+            return bi
+        return get_border_info(node)
+    return ""
+
+
 def px2rpx(px, design_width=375):
     return round(px * 750 / design_width)
 
@@ -485,9 +556,10 @@ def _infer_padding(node):
     al = get_autolayout(node)
     if al is not None and al["padding"] is not None:
         pad = al["padding"]
-        # 仅 HUG（内容撑开）方向才可能是 padding 撑开；FIXED 是定宽定高，不标 padding
-        v_valid = al["sizing_v"] == "HUG" and (pad["top"] > 0 or pad["bottom"] > 0)
-        h_valid = al["sizing_h"] == "HUG" and (pad["left"] > 0 or pad["right"] > 0)
+        # 任意方向，只要 autolayout 明确给了 padding 就输出（不再仅限 HUG）：
+        # FIXED 定尺寸容器同样可能内边距撑开，开发照值实现即可。
+        v_valid = pad["top"] > 0 or pad["bottom"] > 0
+        h_valid = pad["left"] > 0 or pad["right"] > 0
         return {
             "vertical": {"top": pad["top"], "bottom": pad["bottom"], "valid": v_valid},
             "horizontal": {"left": pad["left"], "right": pad["right"], "valid": h_valid},
@@ -503,12 +575,25 @@ def _infer_padding(node):
     if len(children) < 1 or cw <= 0 or ch <= 0:
         return {"vertical": empty(), "horizontal": empty()}
 
-    # 背景矩形：尺寸与容器几乎相等（容差 0.5px）且只是填充块，不计入内容边界。
+    # 背景矩形/段：尺寸与容器几乎相等（容差 0.5px）且只是填充块，不计入内容边界。
+    # 放宽：徽章常用「等高贴顶的侧边彩色段」(如跨区徽章的 32×23 暗色段) 或「等宽贴左段」，
+    # 这类段与容器等高/等宽且贴边，本质也是背景，应排除，否则会把文字相对它的内缩误判为 0。
+    ntop = bn.get("top", 0)
+    nleft = bn.get("left", 0)
+
     def is_bg_rect(c):
         cb = c.get("bounds", {})
-        return (c.get("type") in ("RECTANGLE", "VECTOR")
-                and abs(cb.get("width", 0) - cw) <= 0.5
-                and abs(cb.get("height", 0) - ch) <= 0.5)
+        w = cb.get("width", 0)
+        h = cb.get("height", 0)
+        rel_t = round(cb.get("top", 0) - ntop)
+        rel_l = round(cb.get("left", 0) - nleft)
+        if c.get("type") not in ("RECTANGLE", "VECTOR"):
+            return False
+        full_h = abs(h - ch) <= 0.5
+        full_w = abs(w - cw) <= 0.5
+        flush_t = abs(rel_t) <= 0.5
+        flush_l = abs(rel_l) <= 0.5
+        return (full_h and full_w) or (full_h and flush_t) or (full_w and flush_l)
 
     content = [c for c in children if not is_bg_rect(c)]
     if not content:
@@ -532,7 +617,6 @@ def _infer_padding(node):
         "horizontal": {"left": left, "right": right, "valid": h_valid},
     }
 
-
 # ---- 树结构 ----
 
 def build_tree(node, depth=0):
@@ -545,8 +629,13 @@ def build_tree(node, depth=0):
     if ntype == "TEXT":
         ti = get_text_info(node)
         if ti:
+            raw_fills = get_fill_colors(node)
+            comp = get_color(node, "fill")
+            if comp:
+                for t in ti:
+                    t["color"] = comp
             return {"type": ntype, "name": nname, "bounds": bn, "texts": ti, "children": [],
-                    "component": comp_type, "fills": get_fill_colors(node), "borders": get_border_count(node)}
+                    "component": comp_type, "fills": raw_fills, "borders": get_border_count(node)}
         return None
 
     if ntype not in ("FRAME", "GROUP"):
@@ -731,8 +820,7 @@ def generate(root, design_width=375):
     lines = []
     lines.append("# 设计规格文档\n")
     bn = get_bounds(root)
-    fills = get_fill_colors(root)
-    bg = fills[0] if fills else "?"
+    bg = get_color(root, "fill") or "?"
     lines.append(f"**页面**: {bn['width']:.0f}×{bn['height']:.0f}px | **背景**: {bg} | rpx: 1px≈{px2rpx(1)}rpx")
     # 内容区总览：取非全宽的最大子节点宽作为内容区宽度，推算左右 padding
     content_w = 0
@@ -791,13 +879,14 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     flags = []
     # TEXT 节点的 fills 是字体颜色（已在文字行以 #色值 呈现），不是背景，勿输出 bg=
     is_text = node.get("type") == "TEXT"
-    fills = node.get("fills", [])
-    if fills and not is_text:
-        flags.append(f"bg={','.join(fills)}")
+    if not is_text:
+        bg = get_color(node, "fill")
+        if bg:
+            flags.append(f"bg={bg}")
     radius = node.get("radius", [])
     if radius:
         flags.append(f"r={radius}")
-    borders = node.get("border_info", [])
+    borders = get_color(node, "border")
     if borders:
         flags.append(f"border={' / '.join(borders)}")
     opacity = node.get("opacity", 1)
@@ -971,95 +1060,18 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
 
 
 def _generate_impl_notes(tree):
-    """生成实现要点，帮助开发者快速准确地实现设计稿。"""
-    notes = []
-    # 收集页面中所有信息字段行（Form Row / Text Block）是否带分隔线，
-    # 供 analyze 结束后合并成一条精确的「信息字段行」要点，避免逐行输出造成歧义。
-    field_rows = []
+    """生成实现要点。
 
-    def analyze(node, depth=0):
-        comp_type = node.get("component", "")
-        nname = node.get("name", "")
-        fills = node.get("fills", [])
-        borders = node.get("borders", 0)
-        children = node.get("children", [])
-        bn = node.get("bounds", {})
-
-        # 检测 info-row 类型（Form Row 或 Text Block 的字段行）
-        # 排除表格单元格：自身或子节点带 border 的格子是表格列，不是信息字段行
-        _is_table_cell = borders > 0 or any(c.get("borders", 0) for c in children)
-        if comp_type in ("Form Row", "Text Block") and len(children) >= 2 and not _is_table_cell:
-            # 基于真实数据判断字段行之间是否有分隔线：仅认 component==Divider
-            # （由 infer_component_type 按 height<=1 判定的真实分隔线，如 Vector 分隔线）。
-            # 不能把 RECTANGLE 类型都算分隔线——Tab 高亮指示条(如蓝色小横条)虽是 RECTANGLE 但并非分隔线。
-            has_divider = any(c.get("component") == "Divider" for c in children)
-            field_rows.append((nname, has_divider))
-
-        # 检测白色背景的大区块（可能是信息区或商品区）
-        if comp_type == "Container" and fills and "#FFFFFF" in fills:
-            w = bn.get("width", 0)
-            h = bn.get("height", 0)
-            root_w = tree.get("bounds", {}).get("width", 0) or 0
-            if root_w and w >= root_w * 0.85 and h >= 200:
-                page_bg = tree.get("fills", ["#F2F2F2"])[0] if tree.get("fills") else "#F2F2F2"
-                notes.append(f"**白色区块**（`{nname or 'Container'}`）：背景色为 `#FFFFFF`，与页面背景 `{page_bg}` 区分")
-        
-        # 检测 Vector 分隔线
-        for child in children:
-            if child.get("component") == "Divider" and child.get("type") == "VECTOR":
-                c_bn = child.get("bounds", {})
-                if c_bn.get("height", 0) <= 1:
-                    notes.append(f"**分隔线**：`{child.get('name', 'Vector')}` 是 1px 高度的分隔线，注意与 1px 间距区分")
-        
-        for idx, child in enumerate(children):
-            analyze(child, depth + 1)
-    
-    analyze(tree)
-
-    # 统一输出「信息字段行」要点（合并所有字段行的检测结果，避免逐行输出造成歧义）
-    if field_rows:
-        # 去重：同名节点可能多次进入 field_rows（如跨两个表格实例）
-        with_div = list(dict.fromkeys(name for name, d in field_rows if d))
-        if with_div:
-            names = "、".join(f"「{n}」" for n in with_div)
-            notes.append(
-                f"**信息字段行**：字段行之间默认**没有分隔线**（不要用 border-bottom）；"
-                f"仅 {names} 带分隔线/指示条，按需实现"
-            )
-        else:
-            notes.append(f"**信息字段行**：字段行之间**没有分隔线**，不要用 border-bottom")
-
-    # 检测底部菜单栏：基于结构（位于页面底部 + 含多个按钮形态子节点）识别，
-    # 不依赖类型标记（摹客原始导出无 Navigation 类型）。判断不了就不输出，避免误导。
-    root_h = tree.get("bounds", {}).get("height", 0) or 0
-    for child in tree.get("children", []):
-        cname = child.get("name", "")
-        cb = child.get("bounds", {})
-        at_bottom = root_h and (cb.get("top", 0) + cb.get("height", 0)) >= root_h - 5
-        # 含多个带文字的按钮形态子节点（按钮/普通文字项 >=2 个）
-        btn_like = [c for c in child.get("children", []) if c.get("texts") or c.get("component") == "Button"]
-        if ("菜单栏" in cname) or (at_bottom and len(btn_like) >= 2):
-            notes.append(
-                f"**底部菜单栏**：建议**固定吸底**（`position: fixed/sticky`，bottom: 0），"
-                f"层级高于内容区，白色背景遮挡下方滚动内容"
-            )
-            break
-
-    # 全局默认原则（始终输出，作为实现要点首条）：容器尺寸优先用 padding 撑开，不写死宽高。
+    仅保留一条全局默认原则（容器尺寸用 padding 撑开、不写死宽高）；其余设计事实
+    均在「页面结构」树的 [内边距]/色值/尺寸标注中给出，不在此附加主观建议。
+    """
     default_principle = (
         "**默认原则：容器尺寸优先用 `padding` 撑开，不要写死固定 height/width**。"
         "文档「页面结构」树中标注 `[内边距]` 的容器，其尺寸由子元素 + 上下/左右 padding 撑开，"
         "实现时用 `padding` 即可（精确值见树内 [内边距] 标注）。仅两种例外才写死："
         "① 脚本对该容器尺寸/内容识别不稳定、实现时可能崩溃或报错；② 用户明确要求固定值。"
     )
-    notes.insert(0, default_principle)
-
-    # 添加通用要点
-    if not notes:
-        notes.append("请严格按照规格文档中的色值、字号、间距实现")
-    
-    return notes
-
+    return [default_principle]
 
 def _collect_radii(node):
     """收集节点子树内所有圆角值（含自身与后代），返回排序后的稳定字符串标识。"""
@@ -1227,6 +1239,9 @@ def main():
 
     md = generate(root, args.width)
 
+    parent = os.path.dirname(out_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(out_file, "w") as f:
         f.write(md)
     print(f"✅ 规格文档已生成: {out_file}", file=sys.stderr)
