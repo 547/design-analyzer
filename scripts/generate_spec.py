@@ -107,6 +107,12 @@ def px2rpx(px, design_width=375):
     return round(px * 750 / design_width)
 
 
+def _fmt_px(v):
+    """数值格式化：整数去 .0，小数保留 1 位（如 25.5），不抹掉半像素。"""
+    v = round(float(v), 1)
+    return str(int(v)) if v == int(v) else str(v)
+
+
 # ---- 数据提取 ----
 
 def get_type(node):
@@ -224,7 +230,8 @@ def get_autolayout(node):
     """返回归一化的 autoLayout 信息（摹客权威尺寸/padding 来源）。
 
     字段：sizing_h / sizing_v（HUG/FIXED）、layout_mode（HORIZONTAL/VERTICAL）、
-    padding（{left,top,right,bottom}，缺失键按 0）、item_spacing（子元素间距）。
+    padding（{left,top,right,bottom}，缺失键按 0）、item_spacing（子元素间距）、
+    primary_align / counter_align（主轴/交叉轴对齐，CENTER/MIN/MAX 等）。
     节点无 autoLayout 时返回 None（调用方回退坐标法）。
     """
     al = node.get("autolayout") or node.get("autoLayout")
@@ -249,6 +256,8 @@ def get_autolayout(node):
         "layout_mode": al.get("layoutMode", ""),
         "padding": pad,
         "item_spacing": al.get("itemSpacing", 0) or 0,
+        "primary_align": al.get("primaryAxisAlignItems", ""),
+        "counter_align": al.get("counterAxisAlignItems", ""),
     }
 
 
@@ -544,14 +553,77 @@ def _is_icon_container(node):
                for c in children)
 
 
+def _measured_content_inset(node):
+    """实测「内容包围盒到容器边缘」的距离（坐标法，含内联文字行）。
+
+    返回 {'top','bottom','left','right'} 或 None（无内容/无尺寸）。与 padding
+    字段值的区别：容器内容居中（FIXED/FILL 常见）时，字段值被居中布局吸收、
+    不等于内容到边缘的真实距离（如按钮 padding 字段 10、实测左右 60/上下 14）；
+    而实测距离才是「padding + 内容撑出尺寸」这一响应式实现所需的正确值。
+    """
+    bn = node.get("bounds", {})
+    cw, ch = bn.get("width", 0), bn.get("height", 0)
+    children = [c for c in node.get("children", []) if c.get("bounds")]
+    if cw <= 0 or ch <= 0:
+        return None
+    if len(children) < 1 and not node.get("texts"):
+        return None
+
+    ntop = bn.get("top", 0)
+    nleft = bn.get("left", 0)
+
+    # 背景矩形/段：尺寸与容器几乎相等且只是填充块，不计入内容边界（逻辑同
+    # _infer_padding 的坐标法分支，两处口径保持一致）。
+    def is_bg_rect(c):
+        cb = c.get("bounds", {})
+        w, h = cb.get("width", 0), cb.get("height", 0)
+        rel_t = round(cb.get("top", 0) - ntop)
+        rel_l = round(cb.get("left", 0) - nleft)
+        if c.get("type") not in ("RECTANGLE", "VECTOR"):
+            return False
+        full_h = abs(h - ch) <= 0.5
+        full_w = abs(w - cw) <= 0.5
+        flush_t = abs(rel_t) <= 0.5
+        flush_l = abs(rel_l) <= 0.5
+        return (full_h and full_w) or (full_h and flush_t) or (full_w and flush_l)
+
+    rects = []
+    for c in children:
+        if not is_bg_rect(c):
+            rects.append(c.get("bounds"))
+    for t in node.get("texts", []):
+        tb = t.get("_bounds")
+        if tb:
+            rects.append(tb)
+    if not rects:
+        rects = [c.get("bounds") for c in children] or None
+    if not rects:
+        return None
+
+    tops = [b.get("top", 0) for b in rects]
+    bottoms = [b.get("top", 0) + b.get("height", 0) for b in rects]
+    lefts = [b.get("left", 0) for b in rects]
+    rights = [b.get("left", 0) + b.get("width", 0) for b in rects]
+
+    return {
+        "top": round(min(tops) - ntop),
+        "bottom": round(ntop + ch - max(bottoms)),
+        "left": round(min(lefts) - nleft),
+        "right": round(nleft + cw - max(rights)),
+    }
+
+
 def _infer_padding(node):
     """推断容器的上下/左右内边距（不依赖布局方向，分别按两个主轴计算剩余空间）。
 
     返回 dict：{'vertical': {'top','bottom','valid'}, 'horizontal': {'left','right','valid'}}。
     某方向 valid=True 表示应作为内边距给出（值已在对应 top/bottom/left/right）。
 
-    优先用摹客 autoLayout 权威 padding（且只有 HUG 方向才可能 padding 撑开）；
-    autoLayout 缺失时才回退坐标差值法。
+    优先用摹客 autoLayout 权威 padding；autoLayout 缺失时回退坐标差值法
+    （复用 _measured_content_inset，另受 PADDING_INFER_MAX 上限约束——超过
+    视为大留白而非内边距）。注意：FIXED/FILL 且内容居中的容器，字段值会被
+    居中布局吸收、不等于内容到边缘的真实距离，_render 对这类方向改用
+    _measured_content_inset 的实测值。
     """
     al = get_autolayout(node)
     if al is not None and al["padding"] is not None:
@@ -565,56 +637,19 @@ def _infer_padding(node):
             "horizontal": {"left": pad["left"], "right": pad["right"], "valid": h_valid},
         }
 
-    bn = node.get("bounds", {})
-    cw, ch = bn.get("width", 0), bn.get("height", 0)
-    children = [c for c in node.get("children", []) if c.get("bounds")]
-
     def empty():
         return {"top": 0, "bottom": 0, "left": 0, "right": 0, "valid": False}
 
-    if len(children) < 1 or cw <= 0 or ch <= 0:
+    mi = _measured_content_inset(node)
+    if mi is None:
         return {"vertical": empty(), "horizontal": empty()}
 
-    # 背景矩形/段：尺寸与容器几乎相等（容差 0.5px）且只是填充块，不计入内容边界。
-    # 放宽：徽章常用「等高贴顶的侧边彩色段」(如跨区徽章的 32×23 暗色段) 或「等宽贴左段」，
-    # 这类段与容器等高/等宽且贴边，本质也是背景，应排除，否则会把文字相对它的内缩误判为 0。
-    ntop = bn.get("top", 0)
-    nleft = bn.get("left", 0)
-
-    def is_bg_rect(c):
-        cb = c.get("bounds", {})
-        w = cb.get("width", 0)
-        h = cb.get("height", 0)
-        rel_t = round(cb.get("top", 0) - ntop)
-        rel_l = round(cb.get("left", 0) - nleft)
-        if c.get("type") not in ("RECTANGLE", "VECTOR"):
-            return False
-        full_h = abs(h - ch) <= 0.5
-        full_w = abs(w - cw) <= 0.5
-        flush_t = abs(rel_t) <= 0.5
-        flush_l = abs(rel_l) <= 0.5
-        return (full_h and full_w) or (full_h and flush_t) or (full_w and flush_l)
-
-    content = [c for c in children if not is_bg_rect(c)]
-    if not content:
-        content = children
-
-    tops = [c.get("bounds", {}).get("top", 0) for c in content]
-    bottoms = [c.get("bounds", {}).get("top", 0) + c.get("bounds", {}).get("height", 0) for c in content]
-    lefts = [c.get("bounds", {}).get("left", 0) for c in content]
-    rights = [c.get("bounds", {}).get("left", 0) + c.get("bounds", {}).get("width", 0) for c in content]
-
-    top = round(min(tops) - bn.get("top", 0))
-    bottom = round(bn.get("top", 0) + ch - max(bottoms))
-    left = round(min(lefts) - bn.get("left", 0))
-    right = round(bn.get("left", 0) + cw - max(rights))
-
-    v_valid = 0 < top <= PADDING_INFER_MAX and 0 < bottom <= PADDING_INFER_MAX
-    h_valid = 0 < left <= PADDING_INFER_MAX and 0 < right <= PADDING_INFER_MAX
+    v_valid = 0 < mi["top"] <= PADDING_INFER_MAX and 0 < mi["bottom"] <= PADDING_INFER_MAX
+    h_valid = 0 < mi["left"] <= PADDING_INFER_MAX and 0 < mi["right"] <= PADDING_INFER_MAX
 
     return {
-        "vertical": {"top": top, "bottom": bottom, "valid": v_valid},
-        "horizontal": {"left": left, "right": right, "valid": h_valid},
+        "vertical": {"top": mi["top"], "bottom": mi["bottom"], "valid": v_valid},
+        "horizontal": {"left": mi["left"], "right": mi["right"], "valid": h_valid},
     }
 
 # ---- 树结构 ----
@@ -821,32 +856,41 @@ def generate(root, design_width=375):
     lines.append("# 设计规格文档\n")
     bn = get_bounds(root)
     bg = get_color(root, "fill") or "?"
-    lines.append(f"**页面**: {bn['width']:.0f}×{bn['height']:.0f}px | **背景**: {bg} | rpx: 1px≈{px2rpx(1)}rpx")
+    lines.append(f"**页面**: {bn['width']:.0f}×{bn['height']:.0f}px | **背景**: {bg} | 单位: px（rpx 仅供参考：1px≈{px2rpx(1)}rpx）")
     # 内容区总览：取非全宽的最大子节点宽作为内容区宽度，推算左右 padding
     content_w = 0
+    content_h = 0
     for child in tree.get("children", []):
         cb = child.get("bounds", {})
         cw = cb.get("width", 0)
         if 0 < cw < bn["width"] and cw > content_w:
             content_w = cw
+            content_h = cb.get("height", 0)
     if content_w and bn["width"]:
         side_pad = round((bn["width"] - content_w) / 2)
         # 单侧留白需同时满足：不超过页宽 15%，且不超过内边距推断上限（PADDING_INFER_MAX），
         # 才视为真实内容 padding；否则判定为画布留白（绝对量概念，用绝对上限兜底，
         # 避免大屏稿阈值被放大到几百 px 仍误判为 padding）。
         if 0 < side_pad <= min(bn["width"] * 0.15, PADDING_INFER_MAX):
-            lines.append(f"**内容区**: 宽 {content_w:.0f}px 居中，左右各 {side_pad}px padding（{content_w:.0f}×…px 容器）")
+            content_size = f"{content_w:.0f}×{content_h:.0f}px" if content_h else f"{content_w:.0f}×…px"
+            lines.append(f"**内容区**: 宽 {content_w:.0f}px 居中，左右各约 {side_pad}px padding（{content_size} 容器）")
         elif content_w < bn["width"]:
             lines.append(f"**内容区**: 宽 {content_w:.0f}px（页面总宽 {bn['width']:.0f}px，左右含画布留白，非内容 padding）")
     lines.append("")
 
     # 可复用组件分析（提前计算，用于正文折叠重复实例）
     reusable = _analyze_reusable_components(tree)
-    # 建立 path → 可复用组件组号 映射（首实例正常展开，其余折叠为引用）
+    # 建立 path → 复用代表描述 映射（首实例正常展开，其余折叠为引用）
     reusable_ref = {}
-    for i, group in enumerate(reusable, 1):
+    for group in reusable:
+        # 值存「代表实例名 + 尺寸」：复用按结构签名分组，代表可能与被折叠实例
+        # 不同名（如 427321776 复用 427321775 的结构）；而同名实例也可能对应
+        # 不同结构（如 Frame 427321777 同时有 245×46 与 245×20 两种），仅给
+        # 名字仍会指代落空。带尺寸后实现者可精确定位到唯一的完整展开行。
+        # membership 判断不受影响。
+        ref = f"{group['name']} {group['size']}"
         for loc in group["locations"][1:]:
-            reusable_ref[loc] = i
+            reusable_ref[loc] = ref
 
     lines.append("\n---\n## 页面结构")
     _render(tree, lines, 0, path=tree.get("name", ""), reusable_ref=reusable_ref)
@@ -870,7 +914,8 @@ def generate(root, design_width=375):
     return "\n".join(lines)
 
 
-def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last=True):
+def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last=True,
+            center_flag="", parent_bounds=None):
     name = node["name"]
     bn = node["bounds"]
     w, ht = bn.get("width", 0), bn.get("height", 0)
@@ -890,7 +935,14 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     if borders:
         flags.append(f"border={' / '.join(borders)}")
     opacity = node.get("opacity", 1)
-    if opacity < 1:
+    hidden_flag = ""
+    if opacity <= 0.01:
+        # 设计稿隐藏图层：裸 opacity=0.0 不够醒目，开发容易照着画出来（如列表
+        # 次行残留的 radio），改为显式「不可见」旗标。必须强调保留占位——
+        # opacity=0 节点仍占布局空间（兄弟间距/文字位置靠它撑出），删节点会
+        # 让相邻元素左移/上移，与设计稿不符。
+        hidden_flag = "不可见: opacity=0，不渲染但保留占位"
+    elif opacity < 1:
         flags.append(f"opacity={opacity}")
     blur = node.get("blur", 0)
     if blur:
@@ -899,7 +951,11 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     if repeat:
         flags.append(f"×{repeat}")
     layout = node.get("layout", {})
-    if layout.get("type") and layout.get("type") != "single":
+    if _overlay_children(node):
+        # 该节点的直接子节点是「全屏半透明遮罩 + 浮于其上的内容容器」叠层结构，
+        # 不是垂直/水平排列。标 vertical 会与实现要点的叠层说明自相矛盾。
+        flags.append("叠层 ↕")
+    elif layout.get("type") and layout.get("type") != "single":
         flags.append(f"{layout['type']} {layout.get('direction', '')}")
 
     flag_str = f" ({'; '.join(flags)})" if flags else ""
@@ -923,7 +979,9 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         connector = "└── " if is_last else "├── "
 
     wflag_str = f" [{width_flag}]" if width_flag else ""
-    lines.append(f"{prefix}{connector}{name} {w:.0f}×{ht:.0f}px{wflag_str}{flag_str}")
+    cflag_str = f" [{center_flag}]" if center_flag else ""
+    hflag_str = f" [{hidden_flag}]" if hidden_flag else ""
+    lines.append(f"{prefix}{connector}{name} {w:.0f}×{ht:.0f}px{wflag_str}{cflag_str}{hflag_str}{flag_str}")
 
     # 子节点/注解的缩进前缀：当前层级往下传 ┊/空格
     child_prefix = prefix
@@ -946,26 +1004,56 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
         fw = f"fw={t['fontWeight']}" if t.get("fontWeight") else ""
         fc = t.get("color", "")
         lh = f"lh={t['lineHeight']}" if t.get("lineHeight") else ""
-        alignment = t.get("alignment", "")
-        if not alignment:
-            # 摹客常无 alignment 字段：据文字中心相对容器中心的水平位置推断对齐，
-            # 避免表头/标题类节点对齐缺失导致开发瞎猜。
-            tb = t.get("_bounds") or {}
-            if tb and w > 0:
-                t_left = tb.get("left", 0)
-                t_w = tb.get("width", 0)
-                t_right = t_left + t_w
-                p_left = bn.get("left", 0)
-                p_right = p_left + w
-                left_margin = t_left - p_left
-                right_margin = p_right - t_right
-                if abs(left_margin - right_margin) <= max(4, w * 0.12):
-                    alignment = "居中"
-                elif left_margin <= right_margin:
-                    alignment = "左"
-                else:
-                    alignment = "右"
-        align_str = f"align={alignment}" if alignment else ""
+        style_align = t.get("alignment", "")
+        # 文字盒对齐据「文字盒相对基准容器的几何位置」推导，不直接采信文字
+        # 样式里的 align 字段作结论：文字盒在容器内居中（左右 inset 近似相等）时，
+        # 样式 align=LEFT 并不代表文字盒视觉上左对齐（标题类节点还原事故的根因）。
+        # 注意这只描述「文字盒」的对齐，不代表盒内文字本身居中——盒内文字仍按
+        # 内部 align 排布，故输出用「文字盒对齐」而非笼统的「视觉对齐」。
+        # 基准容器：内联文字用所在容器；独立 TEXT 子节点用父容器（文字盒必然
+        # 撑满自身，对自身推断无意义）。
+        tb = t.get("_bounds") or {}
+        base_bn = parent_bounds if (is_text and parent_bounds) else bn
+        base_w = base_bn.get("width", 0) or w
+        visual_align = ""
+        geom = None  # (框宽, 基准容器宽, 左inset, 右inset)，冲突时展示供复核
+        if tb and base_w > 0:
+            t_left = tb.get("left", 0)
+            t_w = tb.get("width", 0)
+            t_right = t_left + t_w
+            p_left = base_bn.get("left", 0)
+            p_right = p_left + base_w
+            lm = t_left - p_left
+            rm = p_right - t_right
+            if lm <= 1 and rm <= 1:
+                # 文字盒撑满基准容器：几何推断无意义，文字盒对齐即内部 align
+                # （无样式时回退居中，与历史行为一致）
+                visual_align = style_align or "居中"
+            elif abs(lm - rm) <= max(4, 0.25 * min(lm, rm)):
+                # 居中判据：两侧 inset 近似相等（容差取较小 inset 的 25%，下限 4px）。
+                # 不按容器宽取比例——宽容器下 24/0 这类明显左贴边会被误判居中。
+                visual_align = "居中"
+            elif lm <= rm:
+                visual_align = "左"
+            else:
+                visual_align = "右"
+            geom = (t_w, base_w, lm, rm)
+        if style_align and visual_align and style_align != visual_align and visual_align == "居中":
+            # 样式对齐与文字盒对齐冲突且几何推导为居中：两者分列，附几何数据供
+            # 消费方复核，实现以 文字盒对齐 为准（见 SKILL.md 文字行格式说明）。
+            # 仅居中冲突才展示——几何为 左/右 的差异多来自 flex 行内盒子贴边
+            # （如 radio+文字行），盒子位置是布局结果而非对齐意图，静默以样式为准。
+            # 几何复核数据用无歧义命名：避免「框」被读成「边框」；等号表明是
+            # 属性值，「距父X缘」表明是文字盒到父容器边缘的距离。
+            # 「本行文字节点宽=geom[0]」就是紧邻节点行标的那個宽×高，强调它
+            # 不是另一层框（实现者曾据此误读成两层）；「所在父容器宽」明确
+            # 参照的是 layout 父容器，满足 距左+本节点宽+距右=父容器宽。
+            g = (f" [本行文字节点宽={_fmt_px(geom[0])} / 所在父容器宽={_fmt_px(geom[1])}"
+                 f" / 距父左缘={_fmt_px(geom[2])} / 距父右缘={_fmt_px(geom[3])}]") if geom else ""
+            align_str = f"内部align={style_align} 文字盒对齐={visual_align}{g}"
+        else:
+            # 无冲突或非居中差异：有样式字段时以样式为准，否则输出几何推断结论
+            align_str = f"align={style_align or visual_align}" if (style_align or visual_align) else ""
         extra = " ".join(filter(None, [fs, fw, lh, align_str]))
         lines.append(f"{anno_prefix}- `{t['text']}`  {extra}  {fc}")
 
@@ -1022,7 +1110,9 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
     # 纯文本容器（children 已内联为文字行）：子元素间距来自 autoLayout 的 itemSpacing，
     # 因 raw_children 为空、坐标法失效，改用 autoLayout 权威值直接输出，避免纵向排布的
     # 多个文本丢失间距信息。autoLayout 缺失或间距为 0 时不输出，避免臆造。
-    if not raw_children and node.get("texts"):
+    # 仅 ≥2 行文字才输出「文字行间距」——单文字容器（如按钮）的 itemSpacing
+    # 无对象，输出成噪声曾被实现者追问。
+    if not raw_children and len(node.get("texts", [])) > 1:
         al = get_autolayout(node)
         isp = (al or {}).get("item_spacing", 0) or 0
         if isp > 0:
@@ -1031,47 +1121,214 @@ def _render(node, lines, depth=0, path="", reusable_ref=None, prefix="", is_last
 
     # 内边距推断：仅当某方向差值较小（内边距而非大留白）时注解。
     # 纯图标容器的"留白"是图标视觉内边距，非布局 padding，跳过。
-    pad = {"vertical": {"top": 0, "bottom": 0, "valid": False},
-           "horizontal": {"left": 0, "right": 0, "valid": False}} if _is_icon_container(node) else _infer_padding(node)
+    # 叠层父节点（遮罩+弹窗）的子节点是绝对定位/居中，padding 概念不适用，
+    # 且坐标法会从内容容器位置推算出误导值（曾输出 左39/右40 与全屏遮罩矛盾），
+    # 一并跳过；内容容器位置已在实现要点的弹窗遮罩结构说明中给出。
+    # FIXED/FILL 且内容居中的容器：padding 字段值被居中布局吸收（按钮字段 10、
+    # 实测左右 60/上下 14），照字段值实现会丢响应式语义。改输出实测内容距边
+    # （不受 PADDING_INFER_MAX 限制——它就是「padding+内容撑出尺寸」所需的
+    # 正确值），尾注给出两种自洽实现方案。
+    al_pad = get_autolayout(node)
+    sizing_v = (al_pad or {}).get("sizing_v", "")
+    sizing_h = (al_pad or {}).get("sizing_h", "")
+    if _is_icon_container(node) or _overlay_children(node):
+        pad = {"vertical": {"top": 0, "bottom": 0, "valid": False},
+               "horizontal": {"left": 0, "right": 0, "valid": False}}
+    else:
+        pad = _infer_padding(node)
+    mi = _measured_content_inset(node)
     if pad["vertical"]["valid"]:
         vt, vb = pad["vertical"]["top"], pad["vertical"]["bottom"]
-        if vt == vb:
-            lines.append(f"{anno_prefix}- [内边距] 上下各 {vt}px（容器高度由子元素高度 + 上下 padding 撑开）")
+        if sizing_v == "FIXED":
+            if mi:
+                vt, vb = mi["top"], mi["bottom"]
+            tail = (f"（容器高 {_fmt_px(ht)} = 此实测距离 + 内容高：实现可用 padding 上下 {vt}/{vb} + 内容撑开"
+                    f"（随文案/字号适应，推荐），或写死高 {_fmt_px(ht)} + 内容垂直居中）")
+        elif sizing_v == "FILL":
+            if mi:
+                vt, vb = mi["top"], mi["bottom"]
+            tail = "（容器高度填满父容器：此为内容到边缘的实测距离，实现用 padding 此值 + 内容垂直居中）"
+        elif vt == vb:
+            tail = "（容器高度由子元素高度 + 上下 padding 撑开）"
         else:
-            lines.append(f"{anno_prefix}- [内边距] 上 {vt}px / 下 {vb}px（上下 padding 不等，容器高度由子元素 + padding 撑开）")
+            tail = "（上下 padding 不等，容器高度由子元素 + padding 撑开）"
+        lines.append(f"{anno_prefix}- [内边距] 上 {vt}px / 下 {vb}px{tail}")
     if pad["horizontal"]["valid"]:
         vl, vr = pad["horizontal"]["left"], pad["horizontal"]["right"]
-        if vl == vr:
-            lines.append(f"{anno_prefix}- [内边距] 左右各 {vl}px（容器宽度由子元素宽度 + 左右 padding 撑开）")
+        if sizing_h == "FIXED":
+            if mi:
+                vl, vr = mi["left"], mi["right"]
+            tail = (f"（容器宽 {_fmt_px(w)} = 此实测距离 + 内容宽：实现可用 padding 左右 {vl}/{vr} + 内容撑开"
+                    f"（随文案适应，推荐），或写死宽 {_fmt_px(w)} + 内容水平居中）")
+        elif sizing_h == "FILL":
+            if mi:
+                vl, vr = mi["left"], mi["right"]
+            tail = (f"（容器宽度在父内填满/均分（节点宽 {_fmt_px(w)}）：此为内容到边缘的实测距离；"
+                    f"实现建议 padding 左右 {vl}/{vr} + 内容水平居中，内容随文案伸缩、勿写死宽，"
+                    f"在父内以弹性布局均分）")
+        elif vl == vr:
+            tail = "（容器宽度由子元素宽度 + 左右 padding 撑开）"
         else:
-            lines.append(f"{anno_prefix}- [内边距] 左 {vl}px / 右 {vr}px")
+            tail = ""
+        lines.append(f"{anno_prefix}- [内边距] 左 {vl}px / 右 {vr}px{tail}")
 
     children = merge_repeats(raw_children)
     sorted_children = sort_children(children)
+
+    # 水平居中旗标：仅当父容器 autoLayout 显式声明居中（VERTICAL 的交叉轴 /
+    # HORIZONTAL 的主轴 = CENTER）时输出，不从 bounds 猜测——手动摆放在恰好
+    # 对称时会被误判为居中意图。inset 由 bounds 计算供实现直接取值。
+    al_parent = get_autolayout(node)
+    h_center = (
+        al_parent is not None
+        and ((al_parent.get("layout_mode") == "VERTICAL" and al_parent.get("counter_align") == "CENTER")
+             or (al_parent.get("layout_mode") == "HORIZONTAL" and al_parent.get("primary_align") == "CENTER"))
+    )
 
     for idx, child in enumerate(sorted_children):
         child_path = f"{path} > {child.get('name', '')}" if path else child.get("name", "")
         if reusable_ref and child_path in reusable_ref:
             connector = "└── " if idx == len(sorted_children) - 1 else "├── "
-            lines.append(f"{child_prefix}{connector}[复用] {child.get('name', '')} — 结构同上（与上方同类实例一致，已首次完整展开）")
+            # 引用值已是「代表实例名 + 尺寸」，含尺寸可在同名不同结构的实例间
+            # 唯一定位（如 Frame 427321777 245×20px 与 245×46px 是两种结构）。
+            # 补充「组内文字同代表」：分组签名含文字内容，被折叠实例的文案
+            # 必与代表一致——实现者无法看到被折叠实例的文字，连续两轮审查都
+            # 担心照抄代表文案出错，此处显式声明消除疑虑。
+            rep_ref = reusable_ref.get(child_path) or ""
+            hint = (f"（完整结构见「{rep_ref}」的完整展开处，组内文字同代表）"
+                    if rep_ref else "")
+            lines.append(f"{child_prefix}{connector}[复用] {child.get('name', '')} — 结构与同类实例一致{hint}")
             continue
+        center_flag = ""
+        if h_center:
+            cbn = child.get("bounds", {})
+            pbn = node.get("bounds", {})
+            inset_l = cbn.get("left", 0) - pbn.get("left", 0)
+            inset_r = (pbn.get("left", 0) + pbn.get("width", 0)) - (cbn.get("left", 0) + cbn.get("width", 0))
+            if inset_l > 0.5 and inset_r > 0.5:
+                # 居中保证两侧近似相等，取左侧 inset 输出；子元素撑满（inset≈0）不标
+                center_flag = f"水平居中于父: {_fmt_px(inset_l)}px"
         _render(child, lines, depth + 1, path=child_path, reusable_ref=reusable_ref,
-                prefix=child_prefix, is_last=(idx == len(sorted_children) - 1))
+                prefix=child_prefix, is_last=(idx == len(sorted_children) - 1),
+                center_flag=center_flag, parent_bounds=node.get("bounds", {}))
+
+
+def _overlay_children(node):
+    """判断节点的直接子节点是否构成「全屏半透明遮罩 + 浮于其上的内容容器」叠层。
+
+    返回 (overlay_node, [content_nodes]) 或 None。判据完全来自可确定性数据：
+    遮罩 = 尺寸覆盖父节点 ≥95% 且填充带 alpha（rgba）的兄弟；内容容器 = 其余
+    显著小于父节点的兄弟。供 _render（布局旗标）与 _detect_modal_overlay
+    （实现要点）共用，避免两处口径分歧。
+    """
+    children = node.get("children", [])
+    bn = node.get("bounds", {})
+    pw, ph = bn.get("width", 0), bn.get("height", 0)
+    if len(children) < 2 or not pw or not ph:
+        return None
+    overlay = None
+    contents = []
+    for c in children:
+        cb = c.get("bounds", {})
+        cw, ch = cb.get("width", 0), cb.get("height", 0)
+        fills = c.get("fills") or []
+        if cw >= pw * 0.95 and ch >= ph * 0.95 and any("rgba" in f for f in fills):
+            overlay = c
+        elif cw < pw * 0.95:
+            contents.append(c)
+    if not overlay or not contents:
+        return None
+    return overlay, contents
+
+
+def _detect_modal_overlay(tree):
+    """检测弹窗遮罩模式，返回实现要点文案或 None（判据见 _overlay_children）。
+
+    结构树把遮罩与弹窗画成垂直兄弟，按序实现会排成上下排列（实现者评审实测的
+    最大歧义点）；_render 已据 _overlay_children 把该节点标为「叠层」，此处再
+    给出位置说明（内容容器垂直居中/距顶），两处配合消除歧义。
+    """
+    found = _overlay_children(tree)
+    if not found:
+        return None
+    overlay, contents = found
+    ph = tree.get("bounds", {}).get("height", 0)
+    oname = overlay.get("name", "")
+    parts = []
+    for c in contents:
+        cb = c.get("bounds", {})
+        top = cb.get("top", 0)
+        ch = cb.get("height", 0)
+        bottom = ph - top - ch
+        cname = c.get("name", "")
+        if abs(top - bottom) <= 4 and top > 0:
+            pos = f"垂直居中（上下各{_fmt_px(top)}px）"
+        else:
+            pos = f"距顶{_fmt_px(top)}px"
+        parts.append(f"「{cname}」{pos}浮于遮罩「{oname}」之上")
+    return (
+        "**弹窗遮罩结构**：" + "；".join(parts) +
+        "。两者在树中是兄弟节点，实现为叠层（遮罩全屏铺底、内容容器按上述位置"
+        "绝对定位/居中浮于其上），不要按树顺序实现成上下排列。"
+    )
+
+
+def _detect_hidden_state_variants(tree):
+    """检测同名节点「可见/不可见实例并存」：可能对应选中态等状态差异。
+
+    仅陈述可观察事实（并存 + 不可见已标跳过），语义判断显式交还给设计确认，
+    不臆造。返回提示文案或 None。
+    """
+    visible, hidden = set(), set()
+
+    def walk(n):
+        name = n.get("name", "")
+        if name:
+            if n.get("opacity", 1) <= 0.01:
+                hidden.add(name)
+            else:
+                visible.add(name)
+        for c in n.get("children", []):
+            walk(c)
+
+    walk(tree)
+    both = sorted(visible & hidden)
+    if not both:
+        return None
+    names = "、".join(f"「{n}」" for n in both[:3])
+    return (
+        f"**状态差异提示**：{names}等节点同时存在可见与不可见实例（不可见者已标"
+        " [不可见] 不渲染但保留占位）。这可能对应选中态等交互状态，语义请与设计确认后实现，勿臆造。"
+    )
 
 
 def _generate_impl_notes(tree):
     """生成实现要点。
 
-    仅保留一条全局默认原则（容器尺寸用 padding 撑开、不写死宽高）；其余设计事实
-    均在「页面结构」树的 [内边距]/色值/尺寸标注中给出，不在此附加主观建议。
+    默认原则（容器尺寸用 padding 撑开、不写死宽高）恒定输出；其余为跨节点/
+    行为级约束的按页检测结果（如弹窗遮罩叠层）。节点级设计事实均在「页面结构」
+    树的旗标/标注中给出，不在此附加主观建议。
     """
+    notes = []
+    modal_note = _detect_modal_overlay(tree)
+    if modal_note:
+        notes.append(modal_note)
+    hidden_note = _detect_hidden_state_variants(tree)
+    if hidden_note:
+        notes.append(hidden_note)
     default_principle = (
-        "**默认原则：容器尺寸优先用 `padding` 撑开，不要写死固定 height/width**。"
-        "文档「页面结构」树中标注 `[内边距]` 的容器，其尺寸由子元素 + 上下/左右 padding 撑开，"
-        "实现时用 `padding` 即可（精确值见树内 [内边距] 标注）。仅两种例外才写死："
-        "① 脚本对该容器尺寸/内容识别不稳定、实现时可能崩溃或报错；② 用户明确要求固定值。"
+        "**容器尺寸与 padding 规则（按树内 [内边距] 尾注对号入座）**。"
+        "总原则：所有容器优先用「padding + 内容」撑出尺寸、勿写死宽高——"
+        "文案变长或字号差异时自动适应，跨设备表现一致；仅用户明确要求时才写死。"
+        "① 尾注「撑开」→ 该方向不写死：用 [内边距] 精确值（见标注）+ 内容自然撑开。"
+        "② 尾注「固定值」→ [内边距] 已是内容到边缘的实测距离：推荐 padding 此值 + 内容撑开"
+        "（随文案适应），或写死该方向尺寸 + 内容居中——两种都能还原设计值。"
+        "③ 尾注「填满父容器」→ [内边距] 同为实测距离：推荐 padding 此值 + 内容居中"
+        "（内容随文案伸缩），在父容器内以弹性布局排列，勿按节点宽写死。"
+        "无 [内边距] 标注的节点按自身标注实现即可。任何偏离上述规则先与用户确认。"
     )
-    return [default_principle]
+    notes.append(default_principle)
+    return notes
 
 def _collect_radii(node):
     """收集节点子树内所有圆角值（含自身与后代），返回排序后的稳定字符串标识。"""
